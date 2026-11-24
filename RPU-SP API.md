@@ -466,7 +466,7 @@ The Duck Rule command creates a behavior where playing a sample in one class wil
 
 ### Loop Points (`0x63`)
 
-The Loop Points command sets up looping for a given track (or TUID). If multiple voices are playing the same track, then they will all get the loop points applied if Track Number is used. 
+The Loop Points command sets up looping for a given track (or TUID). If multiple voices are playing the same track and “Use TUID” is false, then they will all get the loop points applied (based on Track Number). If a track is currently looping, and the loop points are updated, they will be kept as pending until Loop Point B is reached. Using Loop Points to update an already-looping track allows the controller to jump to different loops in the same track without re-staging the track with Play Ex and needing to track the TUID of the track. If the playing track doesn’t have a Loop Point B, then new looping point will be adopted at the end of the track.
 
 #### Parameters
 * **Flags:** playback flags
@@ -478,29 +478,32 @@ The Loop Points command sets up looping for a given track (or TUID). If multiple
   * `0x20`: Update Loop Count only (all other parameters except Track Number/TUID are ignored)
   * `0x40`: Update Next Track only (all other parameters except Track Number/TUID are ignored)
   * Note: flags 0x20 and 0x40 may be used in conjunction to end the loop and set the next track
-* **Loop Count:** 8-bit unsigned int
+  * `0x80`: Next Track is TUID (***0:*** Next Track is a 16-bit track number, ***1:*** Next Track is a 32-bit TUID)
+* **Loop Count:** 8-bit unsigned integer
   * `0x00`: play through
   * `0x01` - `0xFE`: repeat Loop Count times
   * `0xFF`: repeat forever
-* **A:** 32-bit unsigned int
+* **A:** 32-bit unsigned integer
   * `0x00000000`: Loop point A is start of file
   * `0x00000001 - 0xFFFFFFFF`: Loop point number of ticks (each tick is 1/44100 of a second)
-* **B:** 32-bit unsigned int
+* **B:** 32-bit unsigned integer
   * `0xFFFFFFFF`: Loop point B is end of file
   * `0x00000001 - 0xFFFFFFFE`: Loop point number of ticks (each tick is 1/44100 of a second)
-* **Fade In:** 16-bit unsigned int
+* **Fade In:** 16-bit unsigned integer
   * `0`: No fade in
   * `1-65534`: number of milliseconds to fade in after returning to A Loop point
-* **Fade Out:** 16-bit unsigned int
+* **Fade Out:** 16-bit unsigned integer
   * `0`: No fade out
   * `1-65534`: number of milliseconds to fade out before reaching B Loop point
-* **Alert Margin:** 16-bit unsigned int
+* **Alert Margin:** 16-bit unsigned integer
   * `0`: No alert
   * `1-65535`: number of milliseconds to send alert before reaching B Loop point
-* **Next Track:** Track Number to start when this track has finished
+* **Next Track Number / Next Track TUID:** Track Number (or TUID) to start when this track has finished
   * `0`: No following track
   * `1-65535`: Track Number - this must be staged with Play Ex and waiting to start
-* **Track Number / TUID:** either a 16-bit unsigned int (Track Number) or 32-bit unsigned int (TUID)
+  * or
+  * `0x00010000 - 0xFFFFFFFF`: TUID - from a track staged with Play Ex
+* **Track Number / TUID:** either a 16-bit unsigned integer (Track Number) or 32-bit unsigned integer (TUID)
 
 #### Example Packet (Start Track Number 200 from top of file, through A (00:01), to B (00:02), back to A, stop at B, alert 500ms before each time B is reached)
 
@@ -533,7 +536,7 @@ The Loop Points command sets up looping for a given track (or TUID). If multiple
 | 24 | End of Message (EOM) | `0x55` | 
 
 
-#### Example Packet (Start TUID 4000 from A (00:15) to B (02:00) forever, alert 500ms before finish)
+#### Example Packet (Start TUID 70000 from A (00:15) to B (02:00) forever, alert 500ms before finish)
 
 | Byte Index | Description | Example / Value | 
 | ----- | ----- | ----- | 
@@ -559,9 +562,9 @@ The Loop Points command sets up looping for a given track (or TUID). If multiple
 | 19 | Alert Margin MSB | `0x01` | 
 | 20 | Next Track LSB | `0x00` | 
 | 21 | Next Track MSB | `0x00` | 
-| 22 | TUID byte 0 | `0xA0` | 
-| 23 | TUID byte 1 | `0x0F` | 
-| 24 | TUID byte 2 | `0x00` | 
+| 22 | TUID byte 0 | `0x70` | 
+| 23 | TUID byte 1 | `0x11` | 
+| 24 | TUID byte 2 | `0x01` | 
 | 25 | TUID byte 3 | `0x00` | 
 | 26 | End of Message (EOM) | `0x55` | 
 
@@ -627,6 +630,7 @@ The Set Events Flags command tells the RPU-SP which events that the controller w
   * `0x04`: Music Changed (only pertains to music class)
   * `0x08`: Ducking Change (on/off)
   * `0x10`: Started - sample moved from queued to playing
+  * `0x20`: Staged and Paused - sample was given a voice slot and TUID
 * **Class:** 8-bit unsigned integer
   * `0x00`: Sound Effect (SFX)
   * `0x01`: Callout
@@ -648,21 +652,26 @@ The Set Events Flags command tells the RPU-SP which events that the controller w
 
 ### Set Soundtrack Folder (`0x67`)
 
-The Set Soundtrack Folder tells the RPU-SP to use a folder on the SD card instead of looking for WAV files in the root. Soundtrack folders must be named “AltSoundtrackNNN”, with NNN being an integer between 1-255. Soundtrack 0 is the default and is assumed to be the root of the SD card. The soundtrack folder names do not need to be contiguous. If an SD card contains the folders AltSoundtrack005 and AltSoundtrack20, the number of folders will be calculated to be 3 (the number of folders + the root), and Set Soundtrack Folder of 1 would set folder AltSoundtrack005 as the active folder (ordered by number without leading zeroes, instead of strictly alpha).
+The Set Soundtrack Folder tells the RPU-SP to use a folder on the SD card instead of looking for WAV files in the root. Soundtrack folders must be named “AltSoundtrackNNN”, with NNN being an integer between 1-255. Soundtrack 0 is the default and is assumed to be the root of the SD card. The soundtrack folder names do not need to be contiguous. If an SD card contains the folders AltSoundtrack005 and AltSoundtrack20, the number of folders will be calculated to be 3 (the number of folders + the root), and Set Soundtrack Folder of 1 would set folder AltSoundtrack005 as the active folder (ordered by number without leading zeroes, instead of strictly alpha). If a folder contains an “example.wav”, that can be played to give the operator an idea of the folder’s contents.
 
 #### Parameters
+* **Action:** 8-bit unsigned integer of flags
+  * `0x01`: switch to new folder
+  * `0x02`: pass through to root (if a sample doesn’t exist in folder, map to root folder)
+  * `0x80`: play folder’s “example.wav” 
 * **Folder Num:** 8-bit unsigned integer 
    
-#### Example Packet (Switch to folder “AltSoundtrack2” assuming it’s the 2nd folder on the SD card)
+#### Example Packet (Switch to folder “AltSoundtrack2” assuming it’s the 2nd folder on the SD card, pass through missing tracks to root)
 
 | Byte Index | Description | Example / Value | 
 | ----- | ----- | ----- | 
 | 0 | Start of Message 1 (SOM1) | `0xF0` | 
 | 1 | Start of Message 2 (SOM2) | `0xAA` | 
-| 2 | Packet Length | `0x06` | 
+| 2 | Packet Length | `0x07` | 
 | 3 | CMD: Set Soundtrack Folder | `0x67` | 
-| 4 | Folder Num | `0x02` | 
-| 5 | End of Message (EOM) | `0x55` | 
+| 4 | Action | `0x03` | 
+| 5 | Folder Num | `0x02` | 
+| 6 | End of Message (EOM) | `0x55` | 
 
   
 ---
@@ -675,26 +684,42 @@ If this RPU-SP can emulate a synthesizer (SB-300, Squawk & Talk, DCS, etc.), thi
 #### Parameters
 * **Synth Command:** 8-bit unsigned integer 
   * `0x01`: Get Volume (get a synth volume modifier - this is a left/right scale with 256 being zero change)
-    * Adds 8-bit unsigned int for volume ID
+    * Adds 8-bit unsigned integer for volume ID
       * `0x01`: Synth Volume
       * `0x02`: DAC Volume
       * `0x03`: CVSD Volume
   * `0x02`: Set Volume (set a synth volume L/R modifier)
-    * Adds 8-bit unsigned int for volume ID
+    * Adds 8-bit unsigned integer for volume ID
       * `0x01`: Synth Volume
       * `0x02`: DAC Volume
       * `0x03`: CVSD Volume
-    * Adds 16-bit signed int for left modifier (256=no change)
+    * Adds 16-bit signed integer for left modifier (256=no change)
       * LSB: lower byte of left modifier
       * MSB: upper byte of left modifier
-    * Adds 16-bit signed int for right modifier (256=no change)
+    * Adds 16-bit signed integer for right modifier (256=no change)
       * LSB: lower byte of right modifier
       * MSB: upper byte of right modifier
   * `0x03`: Get Num ROMs
   * `0x04`: Get ROM Name
+    * Adds 8-bit unsigned integer for ROM Number
   * `0x05`: Get Current ROM
   * `0x06`: Flash ROM
-    * Adds 8-bit unsigned int for ROM number
+    * Adds 8-bit unsigned integer for ROM number
+  * `0x80`: Synth Available
+    * Adds 16-bit unsigned integer for Synth Type:
+      * `0x0201`: SB100 sound card emulation
+      * `0x0202`: SB300 sound card emulation
+      * `0x0301`: WMS Type 1 sound card emulation
+      * `0x0302`: WMS Type 2 sound card emulation
+      * `0x0A01`: A-12738 sound card emulation
+      * `0x0A02`: DCS sound card emulation
+  * `0x81`: Set Synth Status
+    * Adds 16-bit unsigned integer for Synth Type (see above)
+    * Adds 8-bit unsigned integer for Synth Status
+      * `0x00`: de-activate synth
+      * `0x01`: activate synth
+  * `0x82`: Send Synth Command
+    * Adds 8-bit unsigned integer for command
    
 #### Example Packet (Pan DAC halfway to the left)
 
@@ -722,7 +747,7 @@ If this RPU-SP can emulate a synthesizer (SB-300, Squawk & Talk, DCS, etc.), thi
 The Version String is returned by the RPU-SP after receiving a Get Version (`0x01`) command. 
 
 #### Parameters
-* **Version Data:**:
+* **Version Data:**
   * A variable-length array of ASCII characters representing the firmware version. 
   * The string always starts with `RPU-SP`. A controller that sees `RPU-SP` can use commands `0x60` and up; anything else (the WAV Trigger Firmware answers `"WAV Trigger v1.34   "`, 20 characters padded with spaces) gets only the WAV Trigger commands.
 
@@ -821,27 +846,29 @@ The Event response is sent when a specific system or game event occurs (configur
   * `0x02`: Looping Event - track will loop in Alert Margin milliseconds (based on Loop Points command)
   * `0x03`: Music Changed - music class track has changed
   * `0x04`: Ducking Change - returned class ducking has changed, adds 8-bit value for ducking status
-  * `0x05`: Started - Track Number moved to active voice and assigned a TUID
+  * `0x05`: Started - Track with given Number and TUID has started
+  * `0x06`: Staged and Paused - Track staged in a voice slot with returned TUID
 * **Track Number:** 16-bit unsigned integer
   * 0 - event not associated with a track
   * 1-65535 - Track Number associated with event
 * **TUID:** 32-bit unsigned integer (aka Track Unique Identifier)
   * 0 - event not associated with track
-  * (other) - TUID of track
+  * 0x00010000 - 0xFFFFFFFF - TUID of track
 * **Class:** 8-bit unsigned integer
   * `0x00`: Sound Effect (SFX)
   * `0x01`: Callout
   * `0x02`: Music
 * **Event Data:** Variable-length payload depending on the specific event ID.
   * (for Event ID `0x01`), there is no additional data
-  * (for Event ID `0x02`), **Loop Count:** 8-bit unsigned int
+  * (for Event ID `0x02`), **Loop Count:** 8-bit unsigned integer
   * (for Event ID `0x03`), there is no additional data
-  * (for Event ID `0x04`), **Ducking Status:** 8-bit unsigned int
+  * (for Event ID `0x04`), **Ducking Status:** 8-bit unsigned integer
     * `0x00`: Class is no longer ducked
     * `0x01`: Class is ducked
   * (for Event ID `0x05`), there is no additional data
+  * (for Event ID `0x06`), there is no additional data
 
-#### Example Packet (Track Number 4 (TUID=0x00000FA0) will loop, and has 3 loops left)
+#### Example Packet (Track Number 4 (TUID=0x00011170) will loop, and has 3 loops left)
 
 | Byte Index | Description | Example / Value | 
 | ----- | ----- | ----- | 
@@ -852,9 +879,9 @@ The Event response is sent when a specific system or game event occurs (configur
 | 4 | Event ID | `0x02` | 
 | 5 | Track Number LSB | `0x04` | 
 | 6 | Track Number MSB | `0x00` | 
-| 7 | TUID byte 0 | `0xA0` | 
-| 8 | TUID byte 1 | `0x0F` | 
-| 9 | TUID byte 2 | `0x00` | 
+| 7 | TUID byte 0 | `0x70` | 
+| 8 | TUID byte 1 | `0x11` | 
+| 9 | TUID byte 2 | `0x01` | 
 | 10 | TUID byte 3 | `0x00` | 
 | 11 | Class | 0x02 |
 | 12 | Event Data - Loop Count | 0x03 |
@@ -867,7 +894,7 @@ The Event response is sent when a specific system or game event occurs (configur
 The Soundtrack Response is used to report on the number of soundtracks available on the SD card.
 
 #### Parameters
-* **Soundtrack Count:** 8-bit unsigned int
+* **Soundtrack Count:** 8-bit unsigned integer
 
 #### Example Packet (SD card has 2 AltSoundtrackNNN folders in addition to the root)
 
@@ -888,7 +915,7 @@ The Synth Response carries telemetry or state information originating specifical
 
 #### Parameters
 * **Synth Command:** This tells the controller what command is being responded to
-* (for Synth Command `0x01`)
+* (for Synth Command `0x01`, Get Volume)
   * **Volume ID:** 8-bit integer
     * `0x01`: Synth Volume
     * `0x02`: DAC Volume
@@ -899,14 +926,26 @@ The Synth Response carries telemetry or state information originating specifical
   * **Right Modifier:**
     * LSB: lower byte of Right modifier
     * MSB: upper byte of Right modifier
-* (for Synth Command `0x03`)
+* (for Synth Command `0x03`, Get Num ROMs)
   * **Number of ROMs:** 8-bit unsigned integer
-* (for Synth Command `0x04` or `0x05`)
+* (for Synth Command `0x04` or `0x05`, Get ROM Name)
   * **ROM Name:** 64-character buffer
-* (for Synth Command `0x06`)
+* (for Synth Command `0x06`, Flash ROM)
   * **Percent Complete:** 8-bit unsigned integer
     * `0-100`: progress (sent in 10-point increments)
     * `0xFF`: Flash failed
+* (for Synth Command `0x80`, Synth Available, or `0x81`, Set Synth Status)
+  * **Synth Type:** 16-bit unsigned integer of the synth type
+    * LSB: lower byte of Synth Type
+    * MSB: upper byte of Synth Type
+  * **Synth Capability:** 8-bit unsigned integer
+    * `0x00`: Synth not supported
+    * `0x01 - 0xFF`: Synth supported flags
+      * `0x01`: Synth available
+      * `0x80`: Synth currently on
+* (for Synth Command `0x82`)
+  * **Synth Response:** 8-bit unsigned integer
+    * response byte from the synth
 
 #### Example Packet (Response for Get Current ROM, “Hurricane")
 
