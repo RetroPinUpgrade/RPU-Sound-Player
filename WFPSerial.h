@@ -32,6 +32,7 @@ void WFPSerial_InitSerialCommsWithBaud(uint32_t baudRate);
 void WFPSerial_RegisterAmpPowerCallback(WFPAmpPowerCallback cb);
 uint32_t WFPSerial_LoadBaudRateFromIni(void);
 void WFPSerial_Update(void);
+bool WFPSerial_HasReceivedPacket(void);
 
 // Asynchronous response senders (can be registered with WAVFile_RegisterCallbacks)
 void WFPSerial_SendTrackReport(uint16_t trackNumber, uint8_t voiceIndex, uint8_t voiceStatus);

@@ -30,6 +30,9 @@ extern "C" {
 #define FAST_TRACK_MAP_SIZE         2048
 #define MAX_SUPPORTED_TRACKS        4096
 
+// TUID number space (disjoint from 16-bit track numbers 1..65535)
+#define WAV_TUID_BASE               0x00010000UL
+
 // Section attribute for SRAM2 placement on STM32F405
 #ifndef WAV_SRAM2_ATTR
 #if defined(__GNUC__) && (defined(STM32F405xx) || defined(STM32F4xx))
@@ -72,6 +75,7 @@ extern "C" {
 #define WAV_LOOP_USE_TUID           0x10
 #define WAV_LOOP_UPDATE_COUNT_ONLY  0x20
 #define WAV_LOOP_UPDATE_NEXT_ONLY   0x40
+#define WAV_LOOP_NEXT_IS_TUID       0x80
 
 // Event flag masks (0x66)
 #define WAV_EVTMASK_FINISHED        0x01
@@ -79,6 +83,12 @@ extern "C" {
 #define WAV_EVTMASK_MUSIC_CHANGED   0x04
 #define WAV_EVTMASK_DUCKING_CHANGE  0x08
 #define WAV_EVTMASK_STARTED         0x10
+#define WAV_EVTMASK_STAGED_PAUSED   0x20
+
+// Set Soundtrack Folder action flags (0x67)
+#define WAV_ST_ACTION_SWITCH        0x01
+#define WAV_ST_ACTION_PASSTHROUGH   0x02
+#define WAV_ST_ACTION_EXAMPLE       0x80
 
 // Event IDs (0x8A)
 #define WAV_EVT_TRACK_FINISHED      0x01
@@ -86,6 +96,7 @@ extern "C" {
 #define WAV_EVT_MUSIC_CHANGED       0x03
 #define WAV_EVT_DUCKING_CHANGE      0x04
 #define WAV_EVT_STARTED             0x05
+#define WAV_EVT_STAGED_PAUSED       0x06
 
 // Internal voice playbackFlags bitmask
 #define WAV_FLAG_STEREO             0x0001
@@ -97,6 +108,7 @@ extern "C" {
 #define WAV_FLAG_ALERT_SENT         0x0040
 #define WAV_FLAG_STOP_AFTER_FADE    0x0080
 #define WAV_FLAG_CROSSFADE_OUT      0x0100
+#define WAV_FLAG_LOOP_FADE_IN       0x0200
 
 // Voice lifecycle states
 #define WAV_STATE_FREE              0
@@ -112,6 +124,15 @@ extern "C" {
 #define WAV_EVENT_QUEUE_SIZE        24
 #define WAV_MAX_ALT_SOUNDTRACKS     255
 
+#define WAV_MAX_STORED_LOOPS        128
+typedef struct {
+    uint16_t trackNumber;
+    uint8_t  loopNumber;
+    uint8_t  loopsPerPhrase;
+    uint32_t pointA;
+    uint32_t pointB;
+} WAVStoredLoop;
+
 // SRAM2 direct-cluster map entry (8 bytes each x 2048 = 16KB)
 typedef struct {
     uint32_t sclust;
@@ -125,10 +146,32 @@ typedef struct {
     uint32_t readSample;            // Current refiller file frame
     uint32_t dataStartOffset;       // Byte offset to start of PCM data chunk
 
-    uint32_t voiceUniqueIndex;      // TUID (Track Unique ID)
-    uint32_t startIndexA;           // Loop point A (in sample frames)
-    uint32_t endIndexB;             // Loop point B (0xFFFFFFFF = EOF)
+    uint32_t voiceUniqueIndex;      // TUID (0x00010000..0xFFFFFFFF)
+    uint32_t startIndexA;           // Mixer loop point A (sample frames)
+    uint32_t endIndexB;             // Mixer loop point B (0xFFFFFFFF = EOF)
+    uint32_t refillStartA;          // Refiller loop point A
+    uint32_t refillEndB;            // Refiller loop point B
     uint32_t alertMarginSamples;    // Samples before B to fire loop alert
+
+    // Pending A/B loop update (adopted at next B or EOF boundary)
+    uint32_t pendingStartA;
+    uint32_t pendingEndB;
+    uint32_t pendingFadeInSamples;
+    uint32_t pendingFadeOutSamples;
+    uint32_t pendingAlertMarginSamples;
+    uint32_t pendingNextTrack;
+    uint16_t pendingFlags;
+    uint8_t  pendingLoopCount;
+    volatile uint8_t pendingLoopRefill;
+    volatile uint8_t pendingLoopMix;
+    uint8_t  refillPlayThroughEnd;
+
+    // Phrase support
+    uint8_t  loopsPerPhrase;
+    uint8_t  phraseLoopsLeft;
+    uint8_t  refillLoopsPerPhrase;
+    uint8_t  refillPhraseLoopsLeft;
+    uint8_t  pendingLoopsPerPhrase;    
 
     int32_t  currentGainQ16;        // Current track gain in Q16 dB
     int32_t  targetGainQ16;         // Target track gain in Q16 dB
@@ -138,7 +181,7 @@ typedef struct {
 
     FIL      fil;                   // Raw FatFs file object
     uint16_t fileIndex;             // Track number (1..4096)
-    uint16_t nextTrack;             // Staged track to trigger on finish
+    uint32_t nextTrack;             // Staged track (1..65535) or TUID (0x00010000+)
     uint16_t playbackFlags;         // Internal playback attribute flags
 
     uint8_t  soundClass;            // WAV_CLASS_SFX / CALLOUT / MUSIC
@@ -168,7 +211,7 @@ void WAVFile_RegisterCallbacks(WAVTrackReportCallback reportCb, WAVEventCallback
 void WAVFile_ScanSoundtracks(void);
 void WAVFile_BuildClusterMap(void);
 uint8_t WAVFile_GetSoundtrackCount(void);
-uint8_t WAVFile_SetSoundtrackFolder(uint8_t folderNum);
+uint8_t WAVFile_SetSoundtrackFolder(uint8_t actionFlags, uint8_t folderNum);
 uint16_t WAVFile_GetTrackCount(void);
 uint8_t WAVFile_GetMaxVoices(void);
 
@@ -194,8 +237,10 @@ void WAVFile_SetClassGain(uint8_t soundClass, int16_t gainDb, uint16_t fadeTimeM
 void WAVFile_SetDuckRule(uint8_t duckedClass, uint8_t duckingClass, int8_t gainDb,
                          uint16_t attackMs, uint16_t releaseMs);
 void WAVFile_SetLoopPoints(uint8_t flags, uint8_t loopCount, uint32_t pointA, uint32_t pointB,
-                           uint16_t fadeInMs, uint16_t fadeOutMs, uint16_t alertMarginMs,
-                           uint16_t nextTrack, uint32_t trackOrTuid);
+                           uint16_t fadeInMs, uint16_t fadeOutMs, uint8_t loopsPerPhrase,
+                           uint16_t alertMarginMs, uint32_t nextTrackOrTuid, uint32_t trackOrTuid);
+uint8_t WAVFile_GetTrackLoopCount(uint16_t trackNumber);
+uint8_t WAVFile_GetTrackLoop(uint16_t trackNumber, uint8_t loopIndex, WAVStoredLoop *outLoop);
 void WAVFile_StopClass(uint8_t soundClass, uint16_t fadeTimeMs);
 void WAVFile_SetEventFlags(uint8_t mask, uint8_t soundClass);
 

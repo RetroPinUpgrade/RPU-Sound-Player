@@ -23,7 +23,7 @@ static FATFS *MainFS = NULL;
 
 // Active voices
 WAVFileVoice Voices[MAX_VOICES];
-static uint32_t NextTUID = 1;
+static uint32_t NextTUID = WAV_TUID_BASE;
 static uint32_t WAVCurrentRefillVoice = 0;
 
 // Global system volume (Q16 dB)
@@ -35,12 +35,17 @@ static uint8_t ClassEventMask[WAV_NUM_CLASSES] = { 0, 0, 0 };
 static WAVTrackReportCallback TrackReportCb = NULL;
 static WAVEventCallback EventCb = NULL;
 
-// Soundtrack folder state
+// Soundtrack folder and soundtrack.ini state
 static uint8_t AltSoundtrackNumbers[WAV_MAX_ALT_SOUNDTRACKS];
 static uint8_t AltSoundtrackCount = 0;
 static uint8_t CurrentSoundtrackFolder = 0;
+static uint8_t SoundtrackPassthrough = 0;
 static char ActiveDirPath[80] = "/";
 static uint16_t TotalPlayableTracks = 0;
+
+static WAVStoredLoop StoredLoops[WAV_MAX_STORED_LOOPS];
+static uint16_t StoredLoopCount = 0;
+static char SoundtrackPreview[64] = "";
 
 // Per-class gain and ducking state
 typedef struct {
@@ -84,12 +89,19 @@ typedef struct {
     uint8_t  eventData;
 } QueuedEvent;
 
-
 static QueuedEvent EventQueue[WAV_EVENT_QUEUE_SIZE];
 static volatile uint8_t EventQueueHead = 0;
 static volatile uint8_t EventQueueTail = 0;
 
 // --- Internal Helper Functions ---
+
+static uint32_t AllocateTUID(void) {
+    uint32_t id = NextTUID++;
+    if (NextTUID < WAV_TUID_BASE) {
+        NextTUID = WAV_TUID_BASE;
+    }
+    return id;
+}
 
 static int32_t ClampDbQ16(int32_t valQ16) {
     int32_t minQ16 = (WAV_GAIN_MIN_DB * 65536);
@@ -100,13 +112,13 @@ static int32_t ClampDbQ16(int32_t valQ16) {
 }
 
 static uint32_t GainQ16ToLinearQ14(int32_t dbQ16) {
-    if (dbQ16 <= ((WAV_GAIN_MIN_DB * 65536))) {
+    if (dbQ16 <= (WAV_GAIN_MIN_DB * 65536)) {
         return 0;
     }
-    if (dbQ16 >= ((WAV_GAIN_MAX_DB * 65536))) {
+    if (dbQ16 >= (WAV_GAIN_MAX_DB * 65536)) {
         return GainTableQ14[80];
     }
-    int32_t shifted = dbQ16 - ((WAV_GAIN_MIN_DB * 65536));
+    int32_t shifted = dbQ16 - (WAV_GAIN_MIN_DB * 65536);
     int32_t idx = shifted >> 16;
     int32_t frac = shifted & 0xFFFF;
     if (idx < 0) return 0;
@@ -117,7 +129,7 @@ static uint32_t GainQ16ToLinearQ14(int32_t dbQ16) {
 }
 
 static void PushTrackReport(uint16_t trackNumber, uint8_t voiceIndex, uint8_t voiceStatus) {
-    if (!ReportingEnabled || trackNumber==0) return;
+    if (!ReportingEnabled || trackNumber == 0) return;
     uint8_t nextHead = (uint8_t)((EventQueueHead + 1) % WAV_EVENT_QUEUE_SIZE);
     if (nextHead == EventQueueTail) return;
     QueuedEvent *e = &EventQueue[EventQueueHead];
@@ -138,6 +150,7 @@ static void PushEvent(uint8_t eventId, uint16_t trackNumber, uint32_t tuid,
         case WAV_EVT_MUSIC_CHANGED:  maskBit = WAV_EVTMASK_MUSIC_CHANGED; break;
         case WAV_EVT_DUCKING_CHANGE: maskBit = WAV_EVTMASK_DUCKING_CHANGE; break;
         case WAV_EVT_STARTED:        maskBit = WAV_EVTMASK_STARTED; break;
+        case WAV_EVT_STAGED_PAUSED:  maskBit = WAV_EVTMASK_STAGED_PAUSED; break;
         default: return;
     }
     if ((ClassEventMask[soundClass] & maskBit) == 0) return;
@@ -166,6 +179,13 @@ static int CaseInsensitivePrefix(const char *str, const char *prefix) {
     return 1;
 }
 
+static char *TrimWhitespace(char *s) {
+    while (*s && isspace((unsigned char)*s)) s++;
+    char *end = s + strlen(s);
+    while (end > s && isspace((unsigned char)end[-1])) *(--end) = '\0';
+    return s;
+}
+
 static uint8_t ParseTrackPrefix(const char *fname, uint16_t *outTrack) {
     if (!isdigit((unsigned char)fname[0])) return 0;
     long val = strtol(fname, NULL, 10);
@@ -186,6 +206,30 @@ static uint8_t IsClassPlaying(uint8_t soundClass) {
 }
 
 static void TriggerMusicBarWaiters(void) {
+    uint8_t musicTriggered = 0;
+    for (uint8_t i = 0; i < MAX_VOICES; i++) {
+        WAVFileVoice *v = &Voices[i];
+        if (v->voiceInUse == WAV_STATE_ACTIVE &&
+            (v->playbackFlags & WAV_FLAG_WAIT_FOR_BAR) &&
+            v->soundClass == WAV_CLASS_MUSIC) {
+            musicTriggered = 1;
+            break;
+        }
+    }
+
+    if (musicTriggered) {
+        for (uint8_t i = 0; i < MAX_VOICES; i++) {
+            WAVFileVoice *v = &Voices[i];
+            if (v->voiceInUse == WAV_STATE_ACTIVE &&
+                v->soundClass == WAV_CLASS_MUSIC &&
+                !(v->playbackFlags & (WAV_FLAG_PAUSED | WAV_FLAG_WAIT_FOR_BAR))) {
+                v->voiceInUse = WAV_STATE_STOPPING;
+                PushTrackReport(v->fileIndex, i, 0x00);
+                PushEvent(WAV_EVT_TRACK_FINISHED, v->fileIndex, v->voiceUniqueIndex, v->soundClass, 0, 0);
+            }
+        }
+    }
+
     for (uint8_t i = 0; i < MAX_VOICES; i++) {
         WAVFileVoice *v = &Voices[i];
         if (v->voiceInUse == WAV_STATE_ACTIVE && (v->playbackFlags & WAV_FLAG_WAIT_FOR_BAR)) {
@@ -193,23 +237,62 @@ static void TriggerMusicBarWaiters(void) {
             v->playbackFlags &= (uint16_t)(~WAV_FLAG_PAUSED);
             PushTrackReport(v->fileIndex, i, 0x01);
             PushEvent(WAV_EVT_STARTED, v->fileIndex, v->voiceUniqueIndex, v->soundClass, 0, 0);
+            if (v->soundClass == WAV_CLASS_MUSIC) {
+                PushEvent(WAV_EVT_MUSIC_CHANGED, v->fileIndex, v->voiceUniqueIndex, WAV_CLASS_MUSIC, 0, 0);
+            }
         }
     }
 }
 
-static void TriggerNextTrack(uint16_t nextTrack) {
-    if (nextTrack == 0) return;
+static void TriggerNextTrack(uint32_t nextTrackOrTuid) {
+    if (nextTrackOrTuid == 0) return;
+    uint8_t isTuid = (nextTrackOrTuid >= WAV_TUID_BASE) ? 1 : 0;
     for (uint8_t i = 0; i < MAX_VOICES; i++) {
         WAVFileVoice *v = &Voices[i];
-        if (v->voiceInUse == WAV_STATE_ACTIVE &&
-            v->fileIndex == nextTrack &&
-            (v->playbackFlags & WAV_FLAG_PAUSED)) {
-            v->playbackFlags &= (uint16_t)(~WAV_FLAG_PAUSED);
-            PushTrackReport(v->fileIndex, i, 0x01);
-            PushEvent(WAV_EVT_STARTED, v->fileIndex, v->voiceUniqueIndex, v->soundClass, 0, 0);
+        if (v->voiceInUse != WAV_STATE_ACTIVE) continue;
+        if (!(v->playbackFlags & WAV_FLAG_PAUSED)) continue;
+
+        if (isTuid) {
+            if (v->voiceUniqueIndex != nextTrackOrTuid) continue;
+        } else {
+            if (v->fileIndex != (uint16_t)nextTrackOrTuid) continue;
+        }
+
+        v->playbackFlags &= (uint16_t)(~WAV_FLAG_PAUSED);
+        v->playbackFlags &= (uint16_t)(~WAV_FLAG_WAIT_FOR_BAR);
+        PushTrackReport(v->fileIndex, i, 0x01);
+        PushEvent(WAV_EVT_STARTED, v->fileIndex, v->voiceUniqueIndex, v->soundClass, 0, 0);
+        if (v->soundClass == WAV_CLASS_MUSIC) {
+            PushEvent(WAV_EVT_MUSIC_CHANGED, v->fileIndex, v->voiceUniqueIndex, WAV_CLASS_MUSIC, 0, 0);
+        }
+        break;
+    }
+}
+
+static uint8_t ScanDirForTrack(const char *dirPath, uint16_t trackNumber, FIL *outFil) {
+    DIR dir;
+    FILINFO fno;
+    if (f_opendir(&dir, dirPath) != FR_OK) return 0;
+
+    uint8_t found = 0;
+    while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0]) {
+        if (fno.fattrib & AM_DIR) continue;
+        uint16_t id = 0;
+        if (ParseTrackPrefix(fno.fname, &id) && id == trackNumber) {
+            char fullPath[160];
+            if (dirPath[0] == '/' && dirPath[1] == '\0') {
+                snprintf(fullPath, sizeof(fullPath), "/%.158s", fno.fname);
+            } else {
+                snprintf(fullPath, sizeof(fullPath), "%.79s/%.79s", dirPath, fno.fname);
+            }
+            if (f_open(outFil, fullPath, FA_READ) == FR_OK) {
+                found = 1;
+            }
             break;
         }
     }
+    f_closedir(&dir);
+    return found;
 }
 
 // Open track using SRAM2 fast cluster map (1..2048) or FAT directory search (2049..4096)
@@ -231,29 +314,16 @@ static uint8_t OpenTrackFile(uint16_t trackNumber, FIL *outFil) {
     }
 
     // Fallback path: scan active directory via FatFs
-    DIR dir;
-    FILINFO fno;
-    if (f_opendir(&dir, ActiveDirPath) != FR_OK) return 0;
-
-    uint8_t found = 0;
-    while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0]) {
-        if (fno.fattrib & AM_DIR) continue;
-        uint16_t id = 0;
-        if (ParseTrackPrefix(fno.fname, &id) && id == trackNumber) {
-            char fullPath[160];
-            if (ActiveDirPath[0] == '/' && ActiveDirPath[1] == '\0') {
-                snprintf(fullPath, sizeof(fullPath), "/%.158s", fno.fname);
-            } else {
-                snprintf(fullPath, sizeof(fullPath), "%.79s/%.79s", ActiveDirPath, fno.fname);
-            }
-            if (f_open(outFil, fullPath, FA_READ) == FR_OK) {
-                found = 1;
-            }
-            break;
-        }
+    if (ScanDirForTrack(ActiveDirPath, trackNumber, outFil)) {
+        return 1;
     }
-    f_closedir(&dir);
-    return found;
+
+    // Pass-through to root if enabled on an alternate soundtrack
+    if (SoundtrackPassthrough && CurrentSoundtrackFolder != 0) {
+        return ScanDirForTrack("/", trackNumber, outFil);
+    }
+
+    return 0;
 }
 
 static void FillVoiceHalf(WAVFileVoice *v, uint8_t halfIdx) {
@@ -262,21 +332,40 @@ static void FillVoiceHalf(WAVFileVoice *v, uint8_t halfIdx) {
     uint32_t bytesFilled = 0;
     uint32_t bytesPerSample = (v->playbackFlags & WAV_FLAG_STEREO) ? 4 : 2;
 
-    uint32_t endPoint = v->numSamples;
-    if (v->endIndexB != 0xFFFFFFFF && v->endIndexB > 0 && v->endIndexB < v->numSamples) {
-        endPoint = v->endIndexB;
-    }
-
     while (bytesFilled < bytesNeeded) {
+        uint32_t endPoint = v->numSamples;
+        if (v->refillEndB != 0xFFFFFFFF && v->refillEndB > 0 && v->refillEndB < v->numSamples) {
+            endPoint = v->refillEndB;
+        }
+
         uint32_t stopSample = (v->refillLoopsLeft > 0) ? endPoint :
-            ((v->playbackFlags & WAV_FLAG_PLAY_THROUGH_END) ? v->numSamples : endPoint);
+            (v->refillPlayThroughEnd ? v->numSamples : endPoint);
 
         if (v->readSample >= stopSample) {
-            if (v->refillLoopsLeft > 0) {
+            uint8_t endOfPhrase = (v->refillPhraseLoopsLeft <= 1) ? 1 : 0;
+            if (v->pendingLoopRefill && endOfPhrase) {
+                v->pendingLoopRefill = 0;
+                v->refillStartA = (v->pendingStartA < v->numSamples) ? v->pendingStartA : 0;
+                v->refillEndB = v->pendingEndB;
+                v->refillLoopsLeft = v->pendingLoopCount;
+                v->refillLoopsPerPhrase = (v->pendingLoopsPerPhrase > 0) ? v->pendingLoopsPerPhrase : 1;
+                v->refillPhraseLoopsLeft = v->refillLoopsPerPhrase;
+                v->refillPlayThroughEnd = (v->pendingFlags & WAV_FLAG_PLAY_THROUGH_END) ? 1 : 0;
+                v->readSample = v->refillStartA;
+                if (!v->isFlashSource) {
+                    f_lseek(&v->fil, v->dataStartOffset + (v->readSample * bytesPerSample));
+                }
+                continue;
+            } else if (v->refillLoopsLeft > 0) {
                 if (v->refillLoopsLeft != 0xFF) {
                     v->refillLoopsLeft--;
                 }
-                uint32_t loopA = (v->startIndexA < v->numSamples) ? v->startIndexA : 0;
+                if (v->refillPhraseLoopsLeft > 1) {
+                    v->refillPhraseLoopsLeft--;
+                } else {
+                    v->refillPhraseLoopsLeft = (v->refillLoopsPerPhrase > 0) ? v->refillLoopsPerPhrase : 1;
+                }
+                uint32_t loopA = (v->refillStartA < v->numSamples) ? v->refillStartA : 0;
                 v->readSample = loopA;
                 if (!v->isFlashSource) {
                     f_lseek(&v->fil, v->dataStartOffset + (loopA * bytesPerSample));
@@ -389,6 +478,16 @@ static void StartVoiceInternal(int8_t voiceIdx, FIL *openedFil, uint16_t trackNu
     v->numSamples = 0;
     v->startIndexA = 0;
     v->endIndexB = 0xFFFFFFFF;
+    v->refillStartA = 0;
+    v->refillEndB = 0xFFFFFFFF;
+    v->refillPlayThroughEnd = 0;
+    v->pendingLoopRefill = 0;
+    v->pendingLoopMix = 0;
+    v->loopsPerPhrase = 1;
+    v->phraseLoopsLeft = 1;
+    v->refillLoopsPerPhrase = 1;
+    v->refillPhraseLoopsLeft = 1;
+    v->pendingLoopsPerPhrase = 1;
     v->alertMarginSamples = 0;
     v->fadeInSamples = 0;
     v->fadeOutSamples = 0;
@@ -417,13 +516,12 @@ static void StartVoiceInternal(int8_t voiceIdx, FIL *openedFil, uint16_t trackNu
         v->playbackFlags |= (WAV_FLAG_WAIT_FOR_BAR | WAV_FLAG_PAUSED);
     }
 
-    int32_t clampedQ16 = ClampDbQ16((((int32_t)gainDb) * 65536));
+    int32_t clampedQ16 = ClampDbQ16(((int32_t)gainDb) * 65536);
     v->currentGainQ16 = clampedQ16;
     v->targetGainQ16 = clampedQ16;
     v->fadeStepPerMsQ16 = 0;
 
-    v->voiceUniqueIndex = NextTUID++;
-    if (NextTUID == 0) NextTUID = 1;
+    v->voiceUniqueIndex = AllocateTUID();
 
     // Pre-fill both halves so mixer has immediate audio without stalling
     FillVoiceHalf(v, 0);
@@ -437,6 +535,8 @@ static void StartVoiceInternal(int8_t voiceIdx, FIL *openedFil, uint16_t trackNu
         if (soundClass == WAV_CLASS_MUSIC) {
             PushEvent(WAV_EVT_MUSIC_CHANGED, v->fileIndex, v->voiceUniqueIndex, WAV_CLASS_MUSIC, 0, 0);
         }
+    } else {
+        PushEvent(WAV_EVT_STAGED_PAUSED, v->fileIndex, v->voiceUniqueIndex, v->soundClass, 0, 0);
     }
 }
 
@@ -497,6 +597,235 @@ static void PopNextCallout(void) {
                        item.flags, item.gainDb, item.priority);
 }
 
+
+static void MapDirectoryIntoFileMap(const char *dirPath, uint8_t *upperTrackBitmap) {
+    DIR dir;
+    FILINFO fno;
+    FIL tempFil;
+
+    if (f_opendir(&dir, dirPath) != FR_OK) return;
+
+    while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0]) {
+        if (fno.fattrib & AM_DIR) continue;
+        uint16_t id = 0;
+        if (ParseTrackPrefix(fno.fname, &id)) {
+            if (id <= FAST_TRACK_MAP_SIZE) {
+                char fullPath[160];
+                if (dirPath[0] == '/' && dirPath[1] == '\0') {
+                    snprintf(fullPath, sizeof(fullPath), "/%.158s", fno.fname);
+                } else {
+                    snprintf(fullPath, sizeof(fullPath), "%.79s/%.79s", dirPath, fno.fname);
+                }
+                if (f_open(&tempFil, fullPath, FA_READ) == FR_OK) {
+                    if (FileMap[id - 1].sclust == 0) {
+                        TotalPlayableTracks++;
+                    }
+                    FileMap[id - 1].sclust = tempFil.obj.sclust;
+                    FileMap[id - 1].fsize = (uint32_t)tempFil.obj.objsize;
+                    if (MainFS == NULL) MainFS = tempFil.obj.fs;
+                    f_close(&tempFil);
+                }
+            } else {
+                uint16_t upperIdx = (uint16_t)(id - FAST_TRACK_MAP_SIZE - 1);
+                uint8_t mask = (uint8_t)(1U << (upperIdx & 7));
+                if ((upperTrackBitmap[upperIdx >> 3] & mask) == 0) {
+                    upperTrackBitmap[upperIdx >> 3] |= mask;
+                    TotalPlayableTracks++;
+                }
+            }
+        }
+    }
+    f_closedir(&dir);
+}
+
+
+// Minimal f_gets replacement (does not require FF_USE_STRFUNC)
+static char *IniGets(char *buf, int len, FIL *fp) {
+    int n = 0;
+    UINT br = 0;
+    char c;
+    while (n < len - 1) {
+        if (f_read(fp, &c, 1, &br) != FR_OK || br == 0) break;
+        buf[n++] = c;
+        if (c == '\n') break;
+    }
+    buf[n] = '\0';
+    return (n > 0) ? buf : NULL;
+}
+
+
+static void ReadSoundtrackPreview(const char *dirPath, char *outPreview, size_t outSize) {
+    outPreview[0] = '\0';
+
+    char iniPath[128];
+    if (dirPath[0] == '/' && dirPath[1] == '\0') {
+        snprintf(iniPath, sizeof(iniPath), "/soundtrack.ini");
+    } else {
+        snprintf(iniPath, sizeof(iniPath), "%.79s/soundtrack.ini", dirPath);
+    }
+
+    FIL fil;
+    if (f_open(&fil, iniPath, FA_READ) != FR_OK) return;
+
+    char line[128];
+    uint8_t inMetadata = 0;
+
+    while (IniGets(line, sizeof(line), &fil) != NULL) {
+        char *comment = strpbrk(line, ";#");
+        if (comment != NULL) *comment = '\0';
+
+        char *s = TrimWhitespace(line);
+        if (*s == '\0') continue;
+
+        if (*s == '[') {
+            char *close = strchr(s, ']');
+            if (close == NULL) continue;
+            *close = '\0';
+            inMetadata = CaseInsensitivePrefix(TrimWhitespace(s + 1), "Metadata") ? 1 : 0;
+            continue;
+        }
+
+        if (!inMetadata) continue;
+
+        char *eq = strchr(s, '=');
+        if (eq == NULL) continue;
+        *eq = '\0';
+
+        if (CaseInsensitivePrefix(TrimWhitespace(s), "Preview")) {
+            snprintf(outPreview, outSize, "%s", TrimWhitespace(eq + 1));
+            break;
+        }
+    }
+
+    f_close(&fil);
+}
+
+
+static void LoadSoundtrackIni(const char *dirPath) {
+    StoredLoopCount = 0;
+    SoundtrackPreview[0] = '\0';
+
+    char iniPath[128];
+    if (dirPath[0] == '/' && dirPath[1] == '\0') {
+        snprintf(iniPath, sizeof(iniPath), "/soundtrack.ini");
+    } else {
+        snprintf(iniPath, sizeof(iniPath), "%.79s/soundtrack.ini", dirPath);
+    }
+
+    FIL fil;
+    if (f_open(&fil, iniPath, FA_READ) != FR_OK) return;
+
+    char line[128];
+    uint16_t currentTrack = 0;
+    uint8_t inMetadata = 0;
+
+    while (IniGets(line, sizeof(line), &fil) != NULL) {
+        // Strip comments starting with ';' or '#'
+        char *comment = strpbrk(line, ";#");
+        if (comment != NULL) *comment = '\0';
+
+        char *s = TrimWhitespace(line);
+        if (*s == '\0') continue;
+
+        if (*s == '[') {
+            char *close = strchr(s, ']');
+            if (close == NULL) continue;
+            *close = '\0';
+            char *sec = TrimWhitespace(s + 1);
+            if (CaseInsensitivePrefix(sec, "Metadata")) {
+                inMetadata = 1;
+                currentTrack = 0;
+            } else if (CaseInsensitivePrefix(sec, "Track")) {
+                inMetadata = 0;
+                long trk = strtol(sec + 5, NULL, 10);
+                currentTrack = (trk >= 1 && trk <= MAX_SUPPORTED_TRACKS) ? (uint16_t)trk : 0;
+            } else {
+                inMetadata = 0;
+                currentTrack = 0;
+            }
+            continue;
+        }
+
+        char *eq = strchr(s, '=');
+        if (eq == NULL) continue;
+        *eq = '\0';
+        char *key = TrimWhitespace(s);
+        char *val = TrimWhitespace(eq + 1);
+
+        if (inMetadata && CaseInsensitivePrefix(key, "Preview")) {
+            snprintf(SoundtrackPreview, sizeof(SoundtrackPreview), "%.63s", val);
+        } else if (currentTrack > 0 && CaseInsensitivePrefix(key, "Loop")) {
+            if (StoredLoopCount >= WAV_MAX_STORED_LOOPS) continue;
+            long loopNum = strtol(key + 4, NULL, 10);
+            if (loopNum < 0 || loopNum > 255) continue;
+
+            unsigned long a = 0;
+            unsigned long b = 0;
+            unsigned long lpp = 1;
+            int parsed = sscanf(val, "%lu , %lu , %lu", &a, &b, &lpp);
+            if (parsed >= 2) {
+                if (lpp < 1) lpp = 1;
+                if (lpp > 255) lpp = 255;
+                WAVStoredLoop *entry = &StoredLoops[StoredLoopCount++];
+                entry->trackNumber = currentTrack;
+                entry->loopNumber = (uint8_t)loopNum;
+                entry->loopsPerPhrase = (uint8_t)lpp;
+                entry->pointA = (uint32_t)a;
+                entry->pointB = (uint32_t)b;
+            }
+        }
+    }
+
+    f_close(&fil);
+}
+
+static uint8_t ResolveSoundtrackDir(uint8_t folderNum, char *outPath, size_t outSize) {
+    if (folderNum == 0) {
+        snprintf(outPath, outSize, "/");
+        return 1;
+    }
+    if (folderNum > AltSoundtrackCount) return 0;
+
+    uint8_t targetNum = AltSoundtrackNumbers[folderNum - 1];
+    DIR dir;
+    FILINFO fno;
+    uint8_t found = 0;
+
+    if (f_opendir(&dir, "/") != FR_OK) return 0;
+    while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0]) {
+        if (!(fno.fattrib & AM_DIR)) continue;
+        if (CaseInsensitivePrefix(fno.fname, "AltSoundtrack")) {
+            long val = strtol(fno.fname + 13, NULL, 10);
+            if (val == targetNum) {
+                snprintf(outPath, outSize, "/%.78s", fno.fname);
+                found = 1;
+                break;
+            }
+        }
+    }
+    f_closedir(&dir);
+    return found;
+}
+
+static void AdoptPendingLoopMix(WAVFileVoice *v) {
+    v->pendingLoopMix = 0;
+    v->startIndexA = (v->pendingStartA < v->numSamples) ? v->pendingStartA : 0;
+    v->endIndexB = v->pendingEndB;
+    v->numLoopsLeft = v->pendingLoopCount;
+    v->loopsPerPhrase = (v->pendingLoopsPerPhrase > 0) ? v->pendingLoopsPerPhrase : 1;
+    v->phraseLoopsLeft = v->loopsPerPhrase;
+    v->fadeInSamples = v->pendingFadeInSamples;
+    v->fadeOutSamples = v->pendingFadeOutSamples;
+    v->alertMarginSamples = v->pendingAlertMarginSamples;
+    v->nextTrack = v->pendingNextTrack;
+
+    v->playbackFlags &= (uint16_t)(~(WAV_FLAG_PLAY_THROUGH_END | WAV_FLAG_ALERT_EACH_LOOP | WAV_FLAG_ALERT_SENT));
+    v->playbackFlags |= (uint16_t)(v->pendingFlags & (WAV_FLAG_PLAY_THROUGH_END | WAV_FLAG_ALERT_EACH_LOOP));
+
+    v->curSample = v->startIndexA;
+    v->playbackFlags |= WAV_FLAG_LOOP_FADE_IN;
+}
+
 // --- Public API Implementation ---
 
 void WAVFile_Init(void) {
@@ -509,15 +838,24 @@ void WAVFile_Init(void) {
     for (uint8_t i = 0; i < MAX_VOICES; i++) {
         Voices[i].voiceInUse = WAV_STATE_FREE;
         Voices[i].endIndexB = 0xFFFFFFFF;
+        Voices[i].refillEndB = 0xFFFFFFFF;
+        Voices[i].loopsPerPhrase = 1;
+        Voices[i].phraseLoopsLeft = 1;
+        Voices[i].refillLoopsPerPhrase = 1;
+        Voices[i].refillPhraseLoopsLeft = 1;
+        Voices[i].pendingLoopsPerPhrase = 1;
     }
 
     SystemVolumeQ16 = 0;
     ReportingEnabled = 0;
     EventQueueHead = 0;
     EventQueueTail = 0;
-    NextTUID = 1;
+    NextTUID = WAV_TUID_BASE;
     WAVCurrentRefillVoice = 0;
     CurrentSoundtrackFolder = 0;
+    SoundtrackPassthrough = 0;
+    StoredLoopCount = 0;
+    SoundtrackPreview[0] = '\0';
     strcpy(ActiveDirPath, "/");
 }
 
@@ -559,80 +897,120 @@ void WAVFile_ScanSoundtracks(void) {
     }
 }
 
-void WAVFile_BuildClusterMap(void) {
-    DIR dir;
-    FILINFO fno;
-    FIL tempFil;
 
+void WAVFile_BuildClusterMap(void) {
+    uint8_t upperTrackBitmap[(MAX_SUPPORTED_TRACKS - FAST_TRACK_MAP_SIZE + 7) / 8];
+    memset(upperTrackBitmap, 0, sizeof(upperTrackBitmap));
     memset(FileMap, 0, sizeof(FileMap));
     TotalPlayableTracks = 0;
 
-    if (f_opendir(&dir, ActiveDirPath) != FR_OK) return;
-
-    while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0]) {
-        if (fno.fattrib & AM_DIR) continue;
-        uint16_t id = 0;
-        if (ParseTrackPrefix(fno.fname, &id)) {
-            TotalPlayableTracks++;
-            if (id <= FAST_TRACK_MAP_SIZE) {
-                char fullPath[160];
-                if (ActiveDirPath[0] == '/' && ActiveDirPath[1] == '\0') {
-                    snprintf(fullPath, sizeof(fullPath), "/%.158s", fno.fname);
-                } else {
-                    snprintf(fullPath, sizeof(fullPath), "%.79s/%.79s", ActiveDirPath, fno.fname);
-                }
-                if (f_open(&tempFil, fullPath, FA_READ) == FR_OK) {
-                    FileMap[id - 1].sclust = tempFil.obj.sclust;
-                    FileMap[id - 1].fsize = (uint32_t)tempFil.obj.objsize;
-                    if (MainFS == NULL) MainFS = tempFil.obj.fs;
-                    f_close(&tempFil);
-                }
-            }
-        }
+    if (SoundtrackPassthrough && CurrentSoundtrackFolder != 0) {
+        MapDirectoryIntoFileMap("/", upperTrackBitmap);
     }
-    f_closedir(&dir);
+    MapDirectoryIntoFileMap(ActiveDirPath, upperTrackBitmap);
+    LoadSoundtrackIni(ActiveDirPath);
 }
+
 
 uint8_t WAVFile_GetSoundtrackCount(void) {
     return (uint8_t)(AltSoundtrackCount + 1);
 }
 
-uint8_t WAVFile_SetSoundtrackFolder(uint8_t folderNum) {
-    if (folderNum == 0) {
-        CurrentSoundtrackFolder = 0;
-        strcpy(ActiveDirPath, "/");
-        WAVFile_StopAllVoices();
-        WAVFile_BuildClusterMap();
-        return 1;
+uint8_t WAVFile_SetSoundtrackFolder(uint8_t actionFlags, uint8_t folderNum) {
+    char targetDir[80];
+    if (!ResolveSoundtrackDir(folderNum, targetDir, sizeof(targetDir))) {
+        return 0;
     }
 
-    if (folderNum > AltSoundtrackCount) return 0;
+    if (actionFlags & WAV_ST_ACTION_SWITCH) {
+        uint8_t newPassthrough = (actionFlags & WAV_ST_ACTION_PASSTHROUGH) ? 1 : 0;
+        uint8_t needsRebuild = (folderNum != CurrentSoundtrackFolder) ||
+                            (folderNum != 0 && newPassthrough != SoundtrackPassthrough);
+        CurrentSoundtrackFolder = folderNum;
+        SoundtrackPassthrough = newPassthrough;
+        if (needsRebuild) {
+            snprintf(ActiveDirPath, sizeof(ActiveDirPath), "%.79s", targetDir);
+            WAVFile_StopAllVoices();
+            WAVFile_BuildClusterMap();
+        }
+    }
+    
+    if (actionFlags & WAV_ST_ACTION_EXAMPLE) {
+        char previewBuf[64];
+        const char *previewStr = SoundtrackPreview;
 
-    uint8_t targetNum = AltSoundtrackNumbers[folderNum - 1];
-    DIR dir;
-    FILINFO fno;
-    uint8_t found = 0;
+        if (!(actionFlags & WAV_ST_ACTION_SWITCH)) {
+            ReadSoundtrackPreview(targetDir, previewBuf, sizeof(previewBuf));
+            previewStr = previewBuf;
+        }
 
-    if (f_opendir(&dir, "/") != FR_OK) return 0;
-    while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0]) {
-        if (!(fno.fattrib & AM_DIR)) continue;
-        if (CaseInsensitivePrefix(fno.fname, "AltSoundtrack")) {
-            long val = strtol(fno.fname + 13, NULL, 10);
-            if (val == targetNum) {
-                snprintf(ActiveDirPath, sizeof(ActiveDirPath), "/%.78s", fno.fname);
-                CurrentSoundtrackFolder = folderNum;
-                found = 1;
-                break;
+        if (previewStr[0] != '\0' && isdigit((unsigned char)previewStr[0])) {
+            long previewTrk = strtol(previewStr, NULL, 10);
+            if (previewTrk >= 1 && previewTrk <= MAX_SUPPORTED_TRACKS) {
+                if (actionFlags & WAV_ST_ACTION_SWITCH) {
+                    WAVFile_PlayEx((uint16_t)previewTrk, WAV_CLASS_SFX, 0, 0, 200);
+                } else {
+                    FIL fil;
+                    uint8_t opened = ScanDirForTrack(targetDir, (uint16_t)previewTrk, &fil);
+                    if (!opened && (actionFlags & WAV_ST_ACTION_PASSTHROUGH) && folderNum != 0) {
+                        opened = ScanDirForTrack("/", (uint16_t)previewTrk, &fil);
+                    }
+                    if (opened) {
+                        int8_t voiceIdx = AllocateVoiceSlot(WAV_CLASS_SFX, 200);
+                        if (voiceIdx >= 0) {
+                            StartVoiceInternal(voiceIdx, &fil, (uint16_t)previewTrk, WAV_CLASS_SFX, 0, 0, 200);
+                        } else {
+                            f_close(&fil);
+                        }
+                    }
+                }
+            }
+        } else {
+            const char *fname = (previewStr[0] != '\0') ? previewStr : "example.wav";
+            char examplePath[160];
+            if (targetDir[0] == '/' && targetDir[1] == '\0') {
+                snprintf(examplePath, sizeof(examplePath), "/%.63s", fname);
+            } else {
+                snprintf(examplePath, sizeof(examplePath), "%.79s/%.63s", targetDir, fname);
+            }
+            FIL fil;
+            if (f_open(&fil, examplePath, FA_READ) == FR_OK) {
+                int8_t voiceIdx = AllocateVoiceSlot(WAV_CLASS_SFX, 200);
+                if (voiceIdx >= 0) {
+                    StartVoiceInternal(voiceIdx, &fil, 0, WAV_CLASS_SFX, 0, 0, 200);
+                } else {
+                    f_close(&fil);
+                }
             }
         }
     }
-    f_closedir(&dir);
 
-    if (found) {
-        WAVFile_StopAllVoices();
-        WAVFile_BuildClusterMap();
+    return 1;
+}
+
+uint8_t WAVFile_GetTrackLoopCount(uint16_t trackNumber) {
+    uint8_t count = 0;
+    for (uint16_t i = 0; i < StoredLoopCount; i++) {
+        if (StoredLoops[i].trackNumber == trackNumber) {
+            count++;
+        }
     }
-    return found;
+    return count;
+}
+
+uint8_t WAVFile_GetTrackLoop(uint16_t trackNumber, uint8_t loopIndex, WAVStoredLoop *outLoop) {
+    if (outLoop == NULL) return 0;
+    uint8_t matchIdx = 0;
+    for (uint16_t i = 0; i < StoredLoopCount; i++) {
+        if (StoredLoops[i].trackNumber == trackNumber) {
+            if (matchIdx == loopIndex) {
+                *outLoop = StoredLoops[i];
+                return 1;
+            }
+            matchIdx++;
+        }
+    }
+    return 0;
 }
 
 uint16_t WAVFile_GetTrackCount(void) {
@@ -642,6 +1020,7 @@ uint16_t WAVFile_GetTrackCount(void) {
 uint8_t WAVFile_GetMaxVoices(void) {
     return MAX_VOICES;
 }
+
 
 uint8_t ParseWavHeader(FIL *file, WAVFileVoice *v) {
     uint8_t buffer[12];
@@ -662,6 +1041,7 @@ uint8_t ParseWavHeader(FIL *file, WAVFileVoice *v) {
                              ((uint32_t)buffer[5] << 8) |
                              ((uint32_t)buffer[6] << 16) |
                              ((uint32_t)buffer[7] << 24);
+        uint32_t paddedChunkSize = chunkSize + (chunkSize & 1U);
 
         if (buffer[0] == 'f' && buffer[1] == 'm' && buffer[2] == 't' && buffer[3] == ' ') {
             uint8_t fmtData[16];
@@ -675,14 +1055,14 @@ uint8_t ParseWavHeader(FIL *file, WAVFileVoice *v) {
                          ((uint32_t)fmtData[7] << 24);
             bitsPerSample = (uint16_t)(fmtData[14] | (fmtData[15] << 8));
 
-            if (chunkSize > 16) {
-                f_lseek(file, f_tell(file) + (chunkSize - 16));
+            if (paddedChunkSize > 16) {
+                f_lseek(file, f_tell(file) + (paddedChunkSize - 16));
             }
         } else if (buffer[0] == 'd' && buffer[1] == 'a' && buffer[2] == 't' && buffer[3] == 'a') {
             dataSize = chunkSize;
             break;
         } else {
-            f_lseek(file, f_tell(file) + chunkSize);
+            f_lseek(file, f_tell(file) + paddedChunkSize);
         }
     }
 
@@ -709,6 +1089,7 @@ uint8_t WAVFile_StartVoice(FIL fileToPlay, uint8_t priority) {
     return (Voices[voiceIdx].voiceInUse == WAV_STATE_ACTIVE) ? 1 : 0;
 }
 
+
 uint8_t WAVFile_StartFlashVoice(const uint8_t *dataPtr, uint32_t dataLen) {
     if (dataPtr == NULL || dataLen < 44) return 0;
     int8_t voiceIdx = AllocateVoiceSlot(WAV_CLASS_SFX, 255);
@@ -726,6 +1107,16 @@ uint8_t WAVFile_StartFlashVoice(const uint8_t *dataPtr, uint32_t dataLen) {
     v->readSample = 0;
     v->startIndexA = 0;
     v->endIndexB = 0xFFFFFFFF;
+    v->refillStartA = 0;
+    v->refillEndB = 0xFFFFFFFF;
+    v->refillPlayThroughEnd = 0;
+    v->pendingLoopRefill = 0;
+    v->pendingLoopMix = 0;
+    v->loopsPerPhrase = 1;
+    v->phraseLoopsLeft = 1;
+    v->refillLoopsPerPhrase = 1;
+    v->refillPhraseLoopsLeft = 1;
+    v->pendingLoopsPerPhrase = 1;
     v->numLoopsLeft = 0;
     v->refillLoopsLeft = 0;
     v->alertMarginSamples = 0;
@@ -759,7 +1150,7 @@ uint8_t WAVFile_StartFlashVoice(const uint8_t *dataPtr, uint32_t dataLen) {
                 pcmLen = (pcmOffset + chunkSize <= dataLen) ? chunkSize : (dataLen - pcmOffset);
                 break;
             }
-            pos += 8 + chunkSize;
+            pos += 8 + chunkSize + (chunkSize & 1U);
         }
         if (numChannels == 1) {
             v->playbackFlags &= (uint16_t)(~WAV_FLAG_STEREO);
@@ -770,14 +1161,16 @@ uint8_t WAVFile_StartFlashVoice(const uint8_t *dataPtr, uint32_t dataLen) {
     v->flashBase = dataPtr + pcmOffset;
     v->flashDataLen = pcmLen;
     v->numSamples = pcmLen / bytesPerSample;
-    v->voiceUniqueIndex = NextTUID++;
-    if (NextTUID == 0) NextTUID = 1;
+    v->voiceUniqueIndex = AllocateTUID();
 
     FillVoiceHalf(v, 0);
     FillVoiceHalf(v, 1);
     v->voiceInUse = WAV_STATE_ACTIVE;
     return 1;
 }
+
+
+
 
 uint8_t WAVFile_TrackControl(uint8_t controlCode, uint16_t trackNumber, uint8_t lockFlag) {
     switch (controlCode) {
@@ -811,6 +1204,7 @@ uint8_t WAVFile_TrackControl(uint8_t controlCode, uint16_t trackNumber, uint8_t 
                 } else if (controlCode == WAV_CTRL_STOP) {
                     v->voiceInUse = WAV_STATE_STOPPING;
                     PushTrackReport(v->fileIndex, i, 0x00);
+                    PushEvent(WAV_EVT_TRACK_FINISHED, v->fileIndex, v->voiceUniqueIndex, v->soundClass, 0, 0);
                 } else if (controlCode == WAV_CTRL_LOOP_ON) {
                     v->numLoopsLeft = 0xFF;
                     v->refillLoopsLeft = 0xFF;
@@ -826,11 +1220,14 @@ uint8_t WAVFile_TrackControl(uint8_t controlCode, uint16_t trackNumber, uint8_t 
     }
 }
 
+
 void WAVFile_StopAllVoices(void) {
     for (uint8_t i = 0; i < MAX_VOICES; i++) {
         if (Voices[i].voiceInUse != WAV_STATE_FREE) {
             if (Voices[i].voiceInUse == WAV_STATE_ACTIVE) {
                 PushTrackReport(Voices[i].fileIndex, i, 0x00);
+                PushEvent(WAV_EVT_TRACK_FINISHED, Voices[i].fileIndex, Voices[i].voiceUniqueIndex,
+                          Voices[i].soundClass, 0, 0);
             }
             if (!Voices[i].isFlashSource) {
                 f_close(&Voices[i].fil);
@@ -841,8 +1238,9 @@ void WAVFile_StopAllVoices(void) {
     memset(CalloutQueue, 0, sizeof(CalloutQueue));
 }
 
+
 void WAVFile_SetSystemVolume(int16_t gainDb) {
-    SystemVolumeQ16 = ClampDbQ16((((int32_t)gainDb) * 65536));
+    SystemVolumeQ16 = ClampDbQ16(((int32_t)gainDb) * 65536);
 }
 
 uint8_t WAVFile_GetPlayingTracks(uint16_t *outTracks, uint8_t maxOut) {
@@ -856,7 +1254,7 @@ uint8_t WAVFile_GetPlayingTracks(uint16_t *outTracks, uint8_t maxOut) {
 }
 
 void WAVFile_SetTrackVolume(uint16_t trackNumber, int16_t gainDb) {
-    int32_t gainQ16 = ClampDbQ16((((int32_t)gainDb) * 65536));
+    int32_t gainQ16 = ClampDbQ16(((int32_t)gainDb) * 65536);
     for (uint8_t i = 0; i < MAX_VOICES; i++) {
         if (Voices[i].voiceInUse == WAV_STATE_ACTIVE && Voices[i].fileIndex == trackNumber) {
             Voices[i].currentGainQ16 = gainQ16;
@@ -867,7 +1265,7 @@ void WAVFile_SetTrackVolume(uint16_t trackNumber, int16_t gainDb) {
 }
 
 void WAVFile_FadeTrack(uint16_t trackNumber, int16_t targetDb, uint16_t fadeTimeMs, uint8_t stopFlag) {
-    int32_t targetQ16 = ClampDbQ16((((int32_t)targetDb) * 65536));
+    int32_t targetQ16 = ClampDbQ16(((int32_t)targetDb) * 65536);
     for (uint8_t i = 0; i < MAX_VOICES; i++) {
         WAVFileVoice *v = &Voices[i];
         if (v->voiceInUse == WAV_STATE_ACTIVE && v->fileIndex == trackNumber) {
@@ -898,6 +1296,7 @@ void WAVFile_FadeTrack(uint16_t trackNumber, int16_t targetDb, uint16_t fadeTime
 void WAVFile_SetReporting(uint8_t enabled) {
     ReportingEnabled = enabled ? 1 : 0;
 }
+
 
 uint32_t WAVFile_PlayEx(uint16_t trackNumber, uint8_t soundClass, uint8_t flags,
                         int16_t gainDb, uint8_t priority) {
@@ -930,9 +1329,11 @@ uint32_t WAVFile_PlayEx(uint16_t trackNumber, uint8_t soundClass, uint8_t flags,
         }
     }
 
-    // Music always replaces active music (or crossfades if 0x10 is set); solo-in-class kills same class
+    uint8_t crossfadeActive = 0;
+
+    // Music replaces active music unless paused or waiting for a bar boundary
     if ((flags & WAV_PLAYEX_SOLO_IN_CLASS) ||
-        (soundClass == WAV_CLASS_MUSIC && !(flags & WAV_PLAYEX_PAUSE))) {
+        (soundClass == WAV_CLASS_MUSIC && !(flags & (WAV_PLAYEX_PAUSE | WAV_PLAYEX_WAIT_FOR_BAR)))) {
         for (uint8_t i = 0; i < MAX_VOICES; i++) {
             WAVFileVoice *v = &Voices[i];
             if (v->voiceInUse == WAV_STATE_ACTIVE && v->soundClass == soundClass &&
@@ -942,7 +1343,11 @@ uint32_t WAVFile_PlayEx(uint16_t trackNumber, uint8_t soundClass, uint8_t flags,
                     int32_t targetQ16 = (WAV_GAIN_MIN_DB * 65536);
                     v->targetGainQ16 = targetQ16;
                     v->fadeStepPerMsQ16 = (targetQ16 - v->currentGainQ16) / 500;
+                    if (v->fadeStepPerMsQ16 == 0 && targetQ16 != v->currentGainQ16) {
+                        v->fadeStepPerMsQ16 = -1;
+                    }
                     v->playbackFlags |= (WAV_FLAG_STOP_AFTER_FADE | WAV_FLAG_CROSSFADE_OUT);
+                    crossfadeActive = 1;
                 } else {
                     v->voiceInUse = WAV_STATE_STOPPING;
                     PushTrackReport(v->fileIndex, i, 0x00);
@@ -961,12 +1366,25 @@ uint32_t WAVFile_PlayEx(uint16_t trackNumber, uint8_t soundClass, uint8_t flags,
     }
 
     StartVoiceInternal(voiceIdx, &fil, trackNumber, soundClass, flags, gainDb, priority);
+
+    // Fade in the new voice to match the 500ms crossfade out
+    if (crossfadeActive &&
+        Voices[voiceIdx].voiceInUse == WAV_STATE_ACTIVE &&
+        !(Voices[voiceIdx].playbackFlags & WAV_FLAG_PAUSED)) {
+        WAVFileVoice *nv = &Voices[voiceIdx];
+        nv->currentGainQ16 = (WAV_GAIN_MIN_DB * 65536);
+        nv->fadeStepPerMsQ16 = (nv->targetGainQ16 - nv->currentGainQ16) / 500;
+        if (nv->fadeStepPerMsQ16 == 0 && nv->targetGainQ16 != nv->currentGainQ16) {
+            nv->fadeStepPerMsQ16 = 1;
+        }
+    }
+
     return (Voices[voiceIdx].voiceInUse == WAV_STATE_ACTIVE) ? Voices[voiceIdx].voiceUniqueIndex : 0;
 }
 
 void WAVFile_SetClassGain(uint8_t soundClass, int16_t gainDb, uint16_t fadeTimeMs) {
     if (soundClass >= WAV_NUM_CLASSES) return;
-    int32_t targetQ16 = ClampDbQ16((((int32_t)gainDb) * 65536));
+    int32_t targetQ16 = ClampDbQ16(((int32_t)gainDb) * 65536);
     ClassState *cs = &Classes[soundClass];
 
     if (fadeTimeMs == 0) {
@@ -993,11 +1411,12 @@ void WAVFile_SetDuckRule(uint8_t duckedClass, uint8_t duckingClass, int8_t gainD
 }
 
 void WAVFile_SetLoopPoints(uint8_t flags, uint8_t loopCount, uint32_t pointA, uint32_t pointB,
-                           uint16_t fadeInMs, uint16_t fadeOutMs, uint16_t alertMarginMs,
-                           uint16_t nextTrack, uint32_t trackOrTuid) {
+                           uint16_t fadeInMs, uint16_t fadeOutMs, uint8_t loopsPerPhrase,
+                           uint16_t alertMarginMs, uint32_t nextTrackOrTuid, uint32_t trackOrTuid) {
     uint8_t useTuid = (flags & WAV_LOOP_USE_TUID) ? 1 : 0;
     uint8_t countOnly = (flags & WAV_LOOP_UPDATE_COUNT_ONLY) ? 1 : 0;
     uint8_t nextOnly = (flags & WAV_LOOP_UPDATE_NEXT_ONLY) ? 1 : 0;
+    uint8_t lpp = (loopsPerPhrase > 0) ? loopsPerPhrase : 1;
 
     for (uint8_t i = 0; i < MAX_VOICES; i++) {
         WAVFileVoice *v = &Voices[i];
@@ -1015,22 +1434,50 @@ void WAVFile_SetLoopPoints(uint8_t flags, uint8_t loopCount, uint32_t pointA, ui
                 v->refillLoopsLeft = loopCount;
             }
             if (nextOnly) {
-                v->nextTrack = nextTrack;
+                v->nextTrack = nextTrackOrTuid;
             }
+        } else if (!(v->playbackFlags & WAV_FLAG_PAUSED)) {
+            // Voice is already playing: stage as pending until B (or EOF) phrase boundary is reached
+            v->pendingLoopRefill = 0;
+            v->pendingLoopMix = 0;
+            v->pendingStartA = (pointA < v->numSamples) ? pointA : 0;
+            v->pendingEndB = pointB;
+            v->pendingLoopCount = loopCount;
+            v->pendingLoopsPerPhrase = lpp;
+            v->pendingFadeInSamples = ((uint32_t)fadeInMs * AUDIO_FREQ) / 1000;
+            v->pendingFadeOutSamples = ((uint32_t)fadeOutMs * AUDIO_FREQ) / 1000;
+            v->pendingAlertMarginSamples = ((uint32_t)alertMarginMs * AUDIO_FREQ) / 1000;
+            v->pendingNextTrack = nextTrackOrTuid;
+            v->pendingFlags = 0;
+            if (flags & WAV_LOOP_PLAY_THROUGH_END) v->pendingFlags |= WAV_FLAG_PLAY_THROUGH_END;
+            if (flags & WAV_LOOP_ALERT_EACH_LOOP) v->pendingFlags |= WAV_FLAG_ALERT_EACH_LOOP;
+            v->pendingLoopRefill = 1;
+            v->pendingLoopMix = 1;
         } else {
+            // Voice is paused/staged: apply immediately
+            v->pendingLoopRefill = 0;
+            v->pendingLoopMix = 0;
             v->numLoopsLeft = loopCount;
             v->refillLoopsLeft = loopCount;
+            v->loopsPerPhrase = lpp;
+            v->phraseLoopsLeft = lpp;
+            v->refillLoopsPerPhrase = lpp;
+            v->refillPhraseLoopsLeft = lpp;
             v->startIndexA = (pointA < v->numSamples) ? pointA : 0;
             v->endIndexB = pointB;
+            v->refillStartA = v->startIndexA;
+            v->refillEndB = pointB;
             v->fadeInSamples = ((uint32_t)fadeInMs * AUDIO_FREQ) / 1000;
             v->fadeOutSamples = ((uint32_t)fadeOutMs * AUDIO_FREQ) / 1000;
             v->alertMarginSamples = ((uint32_t)alertMarginMs * AUDIO_FREQ) / 1000;
-            v->nextTrack = nextTrack;
+            v->nextTrack = nextTrackOrTuid;
 
             if (flags & WAV_LOOP_PLAY_THROUGH_END) {
                 v->playbackFlags |= WAV_FLAG_PLAY_THROUGH_END;
+                v->refillPlayThroughEnd = 1;
             } else {
                 v->playbackFlags &= (uint16_t)(~WAV_FLAG_PLAY_THROUGH_END);
+                v->refillPlayThroughEnd = 0;
             }
 
             if (flags & WAV_LOOP_ALERT_EACH_LOOP) {
@@ -1038,10 +1485,10 @@ void WAVFile_SetLoopPoints(uint8_t flags, uint8_t loopCount, uint32_t pointA, ui
             } else {
                 v->playbackFlags &= (uint16_t)(~WAV_FLAG_ALERT_EACH_LOOP);
             }
-            v->playbackFlags &= (uint16_t)(~WAV_FLAG_ALERT_SENT);
+            v->playbackFlags &= (uint16_t)(~(WAV_FLAG_ALERT_SENT | WAV_FLAG_LOOP_FADE_IN));
 
-            // Seek to start at A if WAV_LOOP_START_AT_TOP is clear and starting playback
-            if ((flags & WAV_LOOP_START_PLAYBACK) && !(flags & WAV_LOOP_START_AT_TOP) && v->startIndexA > 0) {
+            // Pre-seek to A if WAV_LOOP_START_AT_TOP is clear
+            if (!(flags & WAV_LOOP_START_AT_TOP) && v->startIndexA > 0) {
                 uint32_t bytesPerSample = (v->playbackFlags & WAV_FLAG_STEREO) ? 4 : 2;
                 v->curSample = v->startIndexA;
                 v->readSample = v->startIndexA;
@@ -1054,15 +1501,12 @@ void WAVFile_SetLoopPoints(uint8_t flags, uint8_t loopCount, uint32_t pointA, ui
             }
 
             if (flags & WAV_LOOP_START_PLAYBACK) {
-                uint8_t wasPaused = (v->playbackFlags & WAV_FLAG_PAUSED) ? 1 : 0;
                 v->playbackFlags &= (uint16_t)(~WAV_FLAG_PAUSED);
                 v->playbackFlags &= (uint16_t)(~WAV_FLAG_WAIT_FOR_BAR);
-                if (wasPaused) {
-                    PushTrackReport(v->fileIndex, i, 0x01);
-                    PushEvent(WAV_EVT_STARTED, v->fileIndex, v->voiceUniqueIndex, v->soundClass, 0, 0);
-                    if (v->soundClass == WAV_CLASS_MUSIC) {
-                        PushEvent(WAV_EVT_MUSIC_CHANGED, v->fileIndex, v->voiceUniqueIndex, WAV_CLASS_MUSIC, 0, 0);
-                    }
+                PushTrackReport(v->fileIndex, i, 0x01);
+                PushEvent(WAV_EVT_STARTED, v->fileIndex, v->voiceUniqueIndex, v->soundClass, 0, 0);
+                if (v->soundClass == WAV_CLASS_MUSIC) {
+                    PushEvent(WAV_EVT_MUSIC_CHANGED, v->fileIndex, v->voiceUniqueIndex, WAV_CLASS_MUSIC, 0, 0);
                 }
             }
         }
@@ -1085,6 +1529,7 @@ void WAVFile_StopClass(uint8_t soundClass, uint16_t fadeTimeMs) {
         if (fadeTimeMs == 0 || (v->playbackFlags & WAV_FLAG_PAUSED)) {
             v->voiceInUse = WAV_STATE_STOPPING;
             PushTrackReport(v->fileIndex, i, 0x00);
+            PushEvent(WAV_EVT_TRACK_FINISHED, v->fileIndex, v->voiceUniqueIndex, v->soundClass, 0, 0);
         } else {
             int32_t targetQ16 = (WAV_GAIN_MIN_DB * 65536);
             v->targetGainQ16 = targetQ16;
@@ -1180,7 +1625,6 @@ void WAVFile_UpdateFades(uint32_t elapsedMs) {
         classActive[c] = IsClassPlaying(c);
     }
 
-
     for (uint8_t ducked = 0; ducked < WAV_NUM_CLASSES; ducked++) {
         int32_t targetDuckQ16 = 0;
         int32_t releaseAttenQ16 = 0;
@@ -1191,7 +1635,7 @@ void WAVFile_UpdateFades(uint32_t elapsedMs) {
         for (uint8_t ducking = 0; ducking < WAV_NUM_CLASSES; ducking++) {
             DuckRule *r = &DuckRules[ducked][ducking];
             if (r->enabled && classActive[ducking]) {
-                int32_t attenQ16 = (((int32_t)r->attenuationDb) * 65536);
+                int32_t attenQ16 = ((int32_t)r->attenuationDb) * 65536;
                 if (!shouldDuck || attenQ16 > targetDuckQ16) {
                     targetDuckQ16 = attenQ16;
                     attackMs = r->attackMs;
@@ -1199,7 +1643,7 @@ void WAVFile_UpdateFades(uint32_t elapsedMs) {
                 shouldDuck = 1;
             } else if (r->enabled && r->releaseMs > releaseMs) {
                 releaseMs = r->releaseMs;
-                releaseAttenQ16 = (((int32_t)r->attenuationDb) * 65536);
+                releaseAttenQ16 = ((int32_t)r->attenuationDb) * 65536;
             }
         }
 
@@ -1231,7 +1675,6 @@ void WAVFile_UpdateFades(uint32_t elapsedMs) {
             }
         }
     }
-
 }
 
 void WAVFile_ProcessEvents(void) {
@@ -1279,7 +1722,8 @@ uint8_t WAVFile_GetNextSample(int32_t *leftChannel, int32_t *rightChannel) {
         if (v->endIndexB != 0xFFFFFFFF && v->endIndexB > 0 && v->endIndexB < v->numSamples) {
             endPoint = v->endIndexB;
         }
-        if (v->fadeInSamples > 0 && v->curSample >= v->startIndexA &&
+        if ((v->playbackFlags & WAV_FLAG_LOOP_FADE_IN) &&
+            v->fadeInSamples > 0 && v->curSample >= v->startIndexA &&
             (v->curSample - v->startIndexA) < v->fadeInSamples) {
             uint32_t pos = v->curSample - v->startIndexA;
             linearQ14 = (linearQ14 * pos) / v->fadeInSamples;
@@ -1307,7 +1751,9 @@ uint8_t WAVFile_GetNextSample(int32_t *leftChannel, int32_t *rightChannel) {
         if (v->alertMarginSamples > 0 && !(v->playbackFlags & WAV_FLAG_ALERT_SENT)) {
             uint32_t alertPos = (endPoint > v->alertMarginSamples) ? (endPoint - v->alertMarginSamples) : 0;
             if (v->curSample >= alertPos) {
-                uint8_t shouldAlert = (v->playbackFlags & WAV_FLAG_ALERT_EACH_LOOP) || (v->numLoopsLeft <= 1);
+                uint8_t endOfPhrase = (v->phraseLoopsLeft <= 1) ? 1 : 0;
+                uint8_t shouldAlert = ((v->playbackFlags & WAV_FLAG_ALERT_EACH_LOOP) && endOfPhrase) ||
+                                      (v->numLoopsLeft <= 1);
                 if (shouldAlert) {
                     PushEvent(WAV_EVT_LOOPING, v->fileIndex, v->voiceUniqueIndex, v->soundClass, 1, v->numLoopsLeft);
                 }
@@ -1320,13 +1766,25 @@ uint8_t WAVFile_GetNextSample(int32_t *leftChannel, int32_t *rightChannel) {
             ((v->playbackFlags & WAV_FLAG_PLAY_THROUGH_END) ? v->numSamples : endPoint);
 
         if (v->curSample >= stopSample) {
-            if (v->numLoopsLeft > 0) {
+            uint8_t endOfPhrase = (v->phraseLoopsLeft <= 1) ? 1 : 0;
+            if (v->pendingLoopMix && endOfPhrase) {
+                AdoptPendingLoopMix(v);
+                if (v->soundClass == WAV_CLASS_MUSIC) {
+                    TriggerMusicBarWaiters();
+                }
+            } else if (v->numLoopsLeft > 0) {
                 if (v->numLoopsLeft != 0xFF) {
                     v->numLoopsLeft--;
                 }
+                if (v->phraseLoopsLeft > 1) {
+                    v->phraseLoopsLeft--;
+                } else {
+                    v->phraseLoopsLeft = (v->loopsPerPhrase > 0) ? v->loopsPerPhrase : 1;
+                }
                 v->curSample = (v->startIndexA < v->numSamples) ? v->startIndexA : 0;
                 v->playbackFlags &= (uint16_t)(~WAV_FLAG_ALERT_SENT);
-                if (v->soundClass == WAV_CLASS_MUSIC) {
+                v->playbackFlags |= WAV_FLAG_LOOP_FADE_IN;
+                if (v->soundClass == WAV_CLASS_MUSIC && endOfPhrase) {
                     TriggerMusicBarWaiters();
                 }
             } else {
@@ -1345,7 +1803,6 @@ uint8_t WAVFile_GetNextSample(int32_t *leftChannel, int32_t *rightChannel) {
     return 1;
 }
 
-
 void WAVFile_MixBlock(int32_t *mixBuffer, uint32_t stereoFrames) {
     memset(mixBuffer, 0, stereoFrames * 2 * sizeof(int32_t));
 
@@ -1362,17 +1819,17 @@ void WAVFile_MixBlock(int32_t *mixBuffer, uint32_t stereoFrames) {
         int32_t totalGainQ16 = v->currentGainQ16 + cs->currentGainQ16 - cs->currentDuckQ16 + SystemVolumeQ16;
         int32_t baseGainQ14 = (int32_t)GainQ16ToLinearQ14(totalGainQ16);
 
-        uint32_t endPoint = v->numSamples;
-        if (v->endIndexB != 0xFFFFFFFF && v->endIndexB > 0 && v->endIndexB < v->numSamples) {
-            endPoint = v->endIndexB;
-        }
-
         uint32_t framesLeft = stereoFrames;
         int32_t *mixPtr = mixBuffer;
 
         while (framesLeft > 0) {
             uint8_t curHalf = (v->bufReadPos >= VOICE_BUF_HALF) ? 1 : 0;
             if (!v->halfReady[curHalf]) break;
+
+            uint32_t endPoint = v->numSamples;
+            if (v->endIndexB != 0xFFFFFFFF && v->endIndexB > 0 && v->endIndexB < v->numSamples) {
+                endPoint = v->endIndexB;
+            }
 
             uint32_t halfEndByte = curHalf ? VOICE_BUF_SIZE : VOICE_BUF_HALF;
             uint32_t framesInHalf = (halfEndByte - v->bufReadPos) >> shiftBytes;
@@ -1388,7 +1845,8 @@ void WAVFile_MixBlock(int32_t *mixBuffer, uint32_t stereoFrames) {
             if (chunk > 0) {
                 int16_t *src = (int16_t *)(v->buffer + v->bufReadPos);
 
-                uint8_t inFadeIn = (v->fadeInSamples > 0 &&
+                uint8_t inFadeIn = ((v->playbackFlags & WAV_FLAG_LOOP_FADE_IN) &&
+                                    v->fadeInSamples > 0 &&
                                     v->curSample < (v->startIndexA + v->fadeInSamples) &&
                                     (v->curSample + chunk) > v->startIndexA);
                 uint32_t fadeOutStart = (endPoint > v->fadeOutSamples) ? (endPoint - v->fadeOutSamples) : 0;
@@ -1418,7 +1876,8 @@ void WAVFile_MixBlock(int32_t *mixBuffer, uint32_t stereoFrames) {
                     uint32_t sampleIdx = v->curSample;
                     for (uint32_t i = 0; i < chunk; i++, sampleIdx++) {
                         int32_t g = baseGainQ14;
-                        if (v->fadeInSamples > 0 && sampleIdx >= v->startIndexA &&
+                        if ((v->playbackFlags & WAV_FLAG_LOOP_FADE_IN) &&
+                            v->fadeInSamples > 0 && sampleIdx >= v->startIndexA &&
                             (sampleIdx - v->startIndexA) < v->fadeInSamples) {
                             g = (int32_t)(((uint32_t)g * (sampleIdx - v->startIndexA)) / v->fadeInSamples);
                         }
@@ -1452,7 +1911,9 @@ void WAVFile_MixBlock(int32_t *mixBuffer, uint32_t stereoFrames) {
             if (v->alertMarginSamples > 0 && !(v->playbackFlags & WAV_FLAG_ALERT_SENT)) {
                 uint32_t alertPos = (endPoint > v->alertMarginSamples) ? (endPoint - v->alertMarginSamples) : 0;
                 if (v->curSample >= alertPos) {
-                    uint8_t shouldAlert = (v->playbackFlags & WAV_FLAG_ALERT_EACH_LOOP) || (v->numLoopsLeft <= 1);
+                    uint8_t endOfPhrase = (v->phraseLoopsLeft <= 1) ? 1 : 0;
+                    uint8_t shouldAlert = ((v->playbackFlags & WAV_FLAG_ALERT_EACH_LOOP) && endOfPhrase) ||
+                                          (v->numLoopsLeft <= 1);
                     if (shouldAlert) {
                         PushEvent(WAV_EVT_LOOPING, v->fileIndex, v->voiceUniqueIndex, v->soundClass, 1, v->numLoopsLeft);
                     }
@@ -1462,13 +1923,25 @@ void WAVFile_MixBlock(int32_t *mixBuffer, uint32_t stereoFrames) {
 
             // Check end of loop / end of file
             if (v->curSample >= stopSample) {
-                if (v->numLoopsLeft > 0) {
+                uint8_t endOfPhrase = (v->phraseLoopsLeft <= 1) ? 1 : 0;
+                if (v->pendingLoopMix && endOfPhrase) {
+                    AdoptPendingLoopMix(v);
+                    if (v->soundClass == WAV_CLASS_MUSIC) {
+                        TriggerMusicBarWaiters();
+                    }
+                } else if (v->numLoopsLeft > 0) {
                     if (v->numLoopsLeft != 0xFF) {
                         v->numLoopsLeft--;
                     }
+                    if (v->phraseLoopsLeft > 1) {
+                        v->phraseLoopsLeft--;
+                    } else {
+                        v->phraseLoopsLeft = (v->loopsPerPhrase > 0) ? v->loopsPerPhrase : 1;
+                    }
                     v->curSample = (v->startIndexA < v->numSamples) ? v->startIndexA : 0;
                     v->playbackFlags &= (uint16_t)(~WAV_FLAG_ALERT_SENT);
-                    if (v->soundClass == WAV_CLASS_MUSIC) {
+                    v->playbackFlags |= WAV_FLAG_LOOP_FADE_IN;
+                    if (v->soundClass == WAV_CLASS_MUSIC && endOfPhrase) {
                         TriggerMusicBarWaiters();
                     }
                 } else {
@@ -1481,10 +1954,10 @@ void WAVFile_MixBlock(int32_t *mixBuffer, uint32_t stereoFrames) {
                     break;
                 }
             }
+
         }
     }
 }
-
 
 WAVFileVoice *WAVFile_GetVoiceSlot(uint8_t slotNum) {
     if (slotNum < MAX_VOICES) return &Voices[slotNum];

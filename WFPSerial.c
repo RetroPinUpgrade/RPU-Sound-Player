@@ -182,6 +182,8 @@ static inline uint8_t PlatformUartReadByte(void) {
 #define CMD_STOP_CLASS              0x65
 #define CMD_SET_EVENTS_FLAGS        0x66
 #define CMD_SET_SOUNDTRACK_FOLDER   0x67
+#define CMD_GET_NUM_LOOPS           0x68
+#define CMD_GET_LOOP_POINTS         0x69
 #define CMD_SYNTH_CONTROL           0x70
 
 // Responses
@@ -191,6 +193,7 @@ static inline uint8_t PlatformUartReadByte(void) {
 #define RSP_TRACK_REPORT            0x84
 #define RSP_EVENT                   0x8A
 #define RSP_SOUNDTRACK              0x8B
+#define RSP_LOOP_REPORT             0x8C
 #define RSP_SYNTH_RESPONSE          0x8F
 
 // ---------------------------------------------------------
@@ -383,11 +386,6 @@ void WFPSerial_OnDuckRule(uint8_t duckedCls, uint8_t duckingCls, int8_t gain, ui
     WAVFile_SetDuckRule(duckedCls, duckingCls, gain, attack, release);
 }
 
-void WFPSerial_OnLoopPoints(uint8_t flags, uint8_t loopCount, uint32_t a, uint32_t b,
-                            uint16_t fadeIn, uint16_t fadeOut, uint16_t alertMargin,
-                            uint16_t nextTrack, uint32_t trackOrTuid) {
-    WAVFile_SetLoopPoints(flags, loopCount, a, b, fadeIn, fadeOut, alertMargin, nextTrack, trackOrTuid);
-}
 
 void WFPSerial_OnGetSoundtrackFolders(void) {
     uint8_t soundtrackCount = WAVFile_GetSoundtrackCount();
@@ -403,6 +401,54 @@ void WFPSerial_OnGetSoundtrackFolders(void) {
     WFPSerial_QueueTxPacket(txBuf, 6);
 }
 
+void WFPSerial_OnLoopPoints(uint8_t flags, uint8_t loopCount, uint32_t a, uint32_t b,
+                            uint16_t fadeIn, uint16_t fadeOut, uint8_t loopsPerPhrase,
+                            uint16_t alertMargin, uint32_t nextTrackOrTuid, uint32_t trackOrTuid) {
+    WAVFile_SetLoopPoints(flags, loopCount, a, b, fadeIn, fadeOut, loopsPerPhrase,
+                          alertMargin, nextTrackOrTuid, trackOrTuid);
+}
+
+void WFPSerial_OnGetNumLoops(uint16_t trackNumber) {
+    uint8_t txBuf[9];
+    txBuf[0] = SOM1;
+    txBuf[1] = SOM2;
+    txBuf[2] = 0x09;
+    txBuf[3] = RSP_LOOP_REPORT;
+    txBuf[4] = (uint8_t)(trackNumber & 0xFF);
+    txBuf[5] = (uint8_t)((trackNumber >> 8) & 0xFF);
+    txBuf[6] = 0x00;
+    txBuf[7] = WAVFile_GetTrackLoopCount(trackNumber);
+    txBuf[8] = EOM;
+    WFPSerial_QueueTxPacket(txBuf, 9);
+}
+
+void WFPSerial_OnGetLoopPoints(uint16_t trackNumber, uint8_t loopIndex) {
+    WAVStoredLoop loop;
+    if (!WAVFile_GetTrackLoop(trackNumber, loopIndex, &loop)) return;
+
+    uint8_t txBuf[19];
+    txBuf[0] = SOM1;
+    txBuf[1] = SOM2;
+    txBuf[2] = 0x13;
+    txBuf[3] = RSP_LOOP_REPORT;
+    txBuf[4] = (uint8_t)(trackNumber & 0xFF);
+    txBuf[5] = (uint8_t)((trackNumber >> 8) & 0xFF);
+    txBuf[6] = 0x01;
+    txBuf[7] = loopIndex;
+    txBuf[8] = loop.loopNumber;
+    txBuf[9] = (uint8_t)(loop.pointA & 0xFF);
+    txBuf[10] = (uint8_t)((loop.pointA >> 8) & 0xFF);
+    txBuf[11] = (uint8_t)((loop.pointA >> 16) & 0xFF);
+    txBuf[12] = (uint8_t)((loop.pointA >> 24) & 0xFF);
+    txBuf[13] = (uint8_t)(loop.pointB & 0xFF);
+    txBuf[14] = (uint8_t)((loop.pointB >> 8) & 0xFF);
+    txBuf[15] = (uint8_t)((loop.pointB >> 16) & 0xFF);
+    txBuf[16] = (uint8_t)((loop.pointB >> 24) & 0xFF);
+    txBuf[17] = loop.loopsPerPhrase;
+    txBuf[18] = EOM;
+    WFPSerial_QueueTxPacket(txBuf, 19);
+}
+
 void WFPSerial_OnStopClass(uint8_t clsId, uint16_t fadeTime) {
     WAVFile_StopClass(clsId, fadeTime);
 }
@@ -411,9 +457,10 @@ void WFPSerial_OnSetEventsFlags(uint8_t mask, uint8_t clsId) {
     WAVFile_SetEventFlags(mask, clsId);
 }
 
-void WFPSerial_OnSetSoundtrackFolder(uint8_t folderNum) {
-    WAVFile_SetSoundtrackFolder(folderNum);
+void WFPSerial_OnSetSoundtrackFolder(uint8_t actionFlags, uint8_t folderNum) {
+    WAVFile_SetSoundtrackFolder(actionFlags, folderNum);
 }
+
 
 // ---------------------------------------------------------
 // Optional Synth Subsystem Handlers (guarded by WFP_ENABLE_SYNTH)
@@ -543,13 +590,35 @@ void WFPSerial_OnGetCurrentROMName(void) {
 }
 #endif
 
+
+static void SendSynthNotSupported(uint8_t synthCmd, uint16_t synthType) {
+    uint8_t txBuf[9];
+    txBuf[0] = SOM1;
+    txBuf[1] = SOM2;
+    txBuf[2] = 9;
+    txBuf[3] = RSP_SYNTH_RESPONSE;
+    txBuf[4] = synthCmd;
+    txBuf[5] = (uint8_t)(synthType & 0xFF);
+    txBuf[6] = (uint8_t)((synthType >> 8) & 0xFF);
+    txBuf[7] = 0x00; // Synth not supported
+    txBuf[8] = EOM;
+    WFPSerial_QueueTxPacket(txBuf, 9);
+}
+
+
 // ---------------------------------------------------------
 // Packet Dispatcher
 // ---------------------------------------------------------
+static bool PacketReceived = false;
+
+bool WFPSerial_HasReceivedPacket(void) {
+    return PacketReceived;
+}
 
 static void WFPSerial_ProcessPacket(const uint8_t *buffer, uint8_t length) {
     if (length < 5) return;
 
+    PacketReceived = true;
     uint8_t cmd = buffer[3];
 
     switch (cmd) {
@@ -654,25 +723,57 @@ static void WFPSerial_ProcessPacket(const uint8_t *buffer, uint8_t length) {
                 WFPSerial_OnDuckRule(ducked, ducking, gain, atk, rel);
             }
             break;
-        case CMD_LOOP_POINTS:
-            if (length >= 25) {
+
+        case CMD_LOOP_POINTS: {
+            if (length >= 26) {
                 uint8_t flags = buffer[4];
-                uint8_t loops = buffer[5];
-                uint32_t a = (uint32_t)buffer[6] | ((uint32_t)buffer[7] << 8) |
-                             ((uint32_t)buffer[8] << 16) | ((uint32_t)buffer[9] << 24);
-                uint32_t b = (uint32_t)buffer[10] | ((uint32_t)buffer[11] << 8) |
-                             ((uint32_t)buffer[12] << 16) | ((uint32_t)buffer[13] << 24);
-                uint16_t fadein = (uint16_t)(buffer[14] | (buffer[15] << 8));
-                uint16_t fadeout = (uint16_t)(buffer[16] | (buffer[17] << 8));
-                uint16_t margin = (uint16_t)(buffer[18] | (buffer[19] << 8));
-                uint16_t nextTrk = (uint16_t)(buffer[20] | (buffer[21] << 8));
-                uint32_t target = (uint32_t)buffer[22] | ((uint32_t)buffer[23] << 8);
-                if ((flags & 0x10) && length >= 27) {
-                    target |= ((uint32_t)buffer[24] << 16) | ((uint32_t)buffer[25] << 24);
+                uint8_t nextIsTuid = (flags & WAV_LOOP_NEXT_IS_TUID) ? 1 : 0;
+                uint8_t useTuid = (flags & WAV_LOOP_USE_TUID) ? 1 : 0;
+                uint8_t expectedLen = (uint8_t)(26 + (nextIsTuid ? 2 : 0) + (useTuid ? 2 : 0));
+                if (length >= expectedLen) {
+                    uint8_t loops = buffer[5];
+                    uint32_t a = (uint32_t)buffer[6] | ((uint32_t)buffer[7] << 8) |
+                                 ((uint32_t)buffer[8] << 16) | ((uint32_t)buffer[9] << 24);
+                    uint32_t b = (uint32_t)buffer[10] | ((uint32_t)buffer[11] << 8) |
+                                 ((uint32_t)buffer[12] << 16) | ((uint32_t)buffer[13] << 24);
+                    uint16_t fadein = (uint16_t)(buffer[14] | (buffer[15] << 8));
+                    uint16_t fadeout = (uint16_t)(buffer[16] | (buffer[17] << 8));
+                    uint8_t loopsPerPhrase = buffer[18];
+                    uint16_t margin = (uint16_t)(buffer[19] | (buffer[20] << 8));
+
+                    uint8_t idx = 21;
+                    uint32_t nextTrk = (uint32_t)buffer[idx] | ((uint32_t)buffer[idx + 1] << 8);
+                    idx += 2;
+                    if (nextIsTuid) {
+                        nextTrk |= ((uint32_t)buffer[idx] << 16) | ((uint32_t)buffer[idx + 1] << 24);
+                        idx += 2;
+                    }
+
+                    uint32_t target = (uint32_t)buffer[idx] | ((uint32_t)buffer[idx + 1] << 8);
+                    idx += 2;
+                    if (useTuid) {
+                        target |= ((uint32_t)buffer[idx] << 16) | ((uint32_t)buffer[idx + 1] << 24);
+                    }
+
+                    WFPSerial_OnLoopPoints(flags, loops, a, b, fadein, fadeout, loopsPerPhrase,
+                                           margin, nextTrk, target);
                 }
-                WFPSerial_OnLoopPoints(flags, loops, a, b, fadein, fadeout, margin, nextTrk, target);
             }
             break;
+        }
+        case CMD_GET_NUM_LOOPS:
+            if (length == 7) {
+                uint16_t trk = (uint16_t)(buffer[4] | (buffer[5] << 8));
+                WFPSerial_OnGetNumLoops(trk);
+            }
+            break;
+        case CMD_GET_LOOP_POINTS:
+            if (length == 8) {
+                uint16_t trk = (uint16_t)(buffer[4] | (buffer[5] << 8));
+                WFPSerial_OnGetLoopPoints(trk, buffer[6]);
+            }
+            break;
+
         case CMD_GET_SOUNDTRACK_FOLDERS:
             if (length == 5) WFPSerial_OnGetSoundtrackFolders();
             break;
@@ -687,13 +788,20 @@ static void WFPSerial_ProcessPacket(const uint8_t *buffer, uint8_t length) {
             if (length == 7) WFPSerial_OnSetEventsFlags(buffer[4], buffer[5]);
             break;
         case CMD_SET_SOUNDTRACK_FOLDER:
-            if (length == 6) WFPSerial_OnSetSoundtrackFolder(buffer[4]);
+            if (length == 7) WFPSerial_OnSetSoundtrackFolder(buffer[4], buffer[5]);
             break;
-#ifdef WFP_ENABLE_SYNTH
         case CMD_SYNTH_CONTROL:
             if (length >= 6) {
                 uint8_t synthCmd = buffer[4];
-                if (synthCmd == 0x01 && length == 7) {
+                if (synthCmd == 0x80 && length == 8) {
+                    uint16_t synthType = (uint16_t)(buffer[5] | (buffer[6] << 8));
+                    SendSynthNotSupported(0x80, synthType);
+                } else if (synthCmd == 0x81 && length == 9) {
+                    uint16_t synthType = (uint16_t)(buffer[5] | (buffer[6] << 8));
+                    SendSynthNotSupported(0x81, synthType);
+                }
+#ifdef WFP_ENABLE_SYNTH
+                else if (synthCmd == 0x01 && length == 7) {
                     WFPSerial_OnGetSynthVolume(buffer[5]);
                 } else if (synthCmd == 0x02 && length == 11) {
                     uint8_t volId = buffer[5];
@@ -709,13 +817,14 @@ static void WFPSerial_ProcessPacket(const uint8_t *buffer, uint8_t length) {
                 } else if (synthCmd == 0x06 && length == 7) {
                     WFPSerial_OnFlashROM(buffer[5]);
                 }
+#endif
             }
             break;
-#endif
         default:
             break;
     }
 }
+
 
 // ---------------------------------------------------------
 // Public API

@@ -232,6 +232,8 @@ extern "C" uint8_t WFPPlatform_UartReadByte(void) {
 }
 
 
+bool StartupBongPending = false;
+
 void setup(void) {
     pinMode(LED_PIN, OUTPUT);
     pinMode(MUTE_PIN, OUTPUT);
@@ -240,11 +242,10 @@ void setup(void) {
     SystemClock_Config();
     WAVFile_Init();
 
-    // Start serial early so we can print boot diagnostics
+    // Start serial early so incoming controller messages are buffered during boot
     WFPSerial_RegisterAmpPowerCallback(OnAmpPowerChange);
     WFPSerial_InitSerialComms();
     delay(200);
-//    RPUSerial.println("\r\n--- RPU-SP Boot ---");
 
     // SD Card Init
     bool sdOk = false;
@@ -256,14 +257,10 @@ void setup(void) {
             delay(50);
         }
     }
-//    RPUSerial.print("SD.begin(): ");
-//    RPUSerial.println(sdOk ? "OK" : "FAILED");
 
     // Check FatFs root directory access directly
     DIR dir;
     FRESULT fr = f_opendir(&dir, "/");
-//    RPUSerial.print("f_opendir('/'): FRESULT=");
-//    RPUSerial.println((int)fr);
     if (fr == FR_OK) {
         f_closedir(&dir);
     }
@@ -274,15 +271,19 @@ void setup(void) {
     WAVFile_BuildClusterMap();
     digitalWrite(LED_PIN, LOW);
 
-//    RPUSerial.print("Tracks found: ");
-//    RPUSerial.println(WAVFile_GetTrackCount());
-
     // Audio Engine Init
     Init_Audio_Hardware();
     HAL_I2S_Transmit_DMA(&Hi2s2, (uint16_t *)DMABuffer, DMA_BUF_SIZE);
-    PlayStartup();
-}
 
+    // Handle any messages that arrived during boot before playing the bong
+    WFPSerial_Update();
+
+    if (!WFPSerial_HasReceivedPacket()) {
+        PlayStartup();
+    } else {
+        StartupBongPending = true;
+    }
+}
 
 unsigned long lastBlinkTime = 0;
 unsigned long lastFadeTime = 0;
@@ -292,10 +293,13 @@ void loop(void) {
     unsigned long now = millis();
 
     // 1. Audio Processing (highest priority)
-    if (HalfTransfer || FullTransfer) {
-        Mixer_Process(DMABuffer, DMA_BUF_SIZE, HalfTransfer, FullTransfer);
+    if (HalfTransfer) {
         HalfTransfer = false;
+        Mixer_Process(DMABuffer, DMA_BUF_SIZE, true, false);
+    }
+    if (FullTransfer) {
         FullTransfer = false;
+        Mixer_Process(DMABuffer, DMA_BUF_SIZE, false, true);
     }
 
     // 2. Serial RX/TX and Deferred Event Dispatch
@@ -311,10 +315,22 @@ void loop(void) {
     // 4. SD Card Voice Buffer Refill
     WAVFile_RefillVoices();
 
-    // 5. Heartbeat LED (250ms)
-    if (now - lastBlinkTime >= 250) {
+    // 5. Play deferred startup bong once all active tracks finish
+    if (0 && StartupBongPending) {
+        uint16_t playing[1];
+        if (WAVFile_GetPlayingTracks(playing, 1) == 0) {
+            StartupBongPending = false;
+            PlayStartup();
+        }
+    }
+
+    // 6. Heartbeat LED (1s)
+    if (now - lastBlinkTime >= 1000) {
         lastBlinkTime = now;
         ledState = !ledState;
         digitalWrite(LED_PIN, ledState);
     }
 }
+
+
+
