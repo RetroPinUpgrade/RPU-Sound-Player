@@ -53,6 +53,8 @@ These are the command packets that the RPU-SP understands (unless marked with �
 | 0x65 | Stop Class | Stop every voice in a class | 
 | 0x66 | Set Events Flags | Set which events receive a response | 
 | 0x67 | Set Soundtrack Folder | Sets which alternate soundtrack to use |
+| 0x68 | Get Num Loops | Number of stored loops for track |
+| 0x69 | Get Loop Points | Read a set of loop points |
 | 0x70 | Synth Control | Controls for synthesizer card | 
 
 Notes:
@@ -72,6 +74,7 @@ The following are response packets to commands or events.
 | 0x84 | Track Report | Report if a track is playing/stopped | 
 | 0x8A | Event | Alert of an event | 
 | 0x8B | Soundtrack | Information about soundtracks |
+| 0x8C | Loop Report | Information about loops |
 | 0x8F | Synth Response | Responses from synthesizer card | 
 
 
@@ -362,7 +365,7 @@ The Play Ex command uses the class system to play a sample in a particular class
   * `0x20`: replace earlier - if this particular track is already playing, replace it
   * `0x40`: pause - if pause is set, the track will be assigned a voice and TUID, but will not start playing until it’s triggered with a `0x63` Loop Points command.
 * **Gain:** 16-bit signed integer (to match other commands)
-  * Overrides class gain
+  * Adds to class gain
   * typical range = -70 to +10
 * **Priority**
   * `0x00 - 0xFF`: higher priority takes precedence
@@ -495,6 +498,8 @@ The Loop Points command sets up looping for a given track (or TUID). If multiple
 * **Fade Out:** 16-bit unsigned integer
   * `0`: No fade out
   * `1-65534`: number of milliseconds to fade out before reaching B Loop point
+* **Loops Per Phrase:** 8-bit unsigned integer
+  * `1-255`: number of (B -> A) transitions before an alert is sent or pending loop points are adopted
 * **Alert Margin:** 16-bit unsigned integer
   * `0`: No alert
   * `1-65535`: number of milliseconds to send alert before reaching B Loop point
@@ -511,7 +516,7 @@ The Loop Points command sets up looping for a given track (or TUID). If multiple
 | ----- | ----- | ----- | 
 | 0 | Start of Message 1 (SOM1) | `0xF0` | 
 | 1 | Start of Message 2 (SOM2) | `0xAA` | 
-| 2 | Packet Length | `0x19` | 
+| 2 | Packet Length | `0x1A` | 
 | 3 | CMD: Loop Points | `0x63` | 
 | 4 | Flags | `0x0B` | 
 | 5 | Loop Count | `0x02` | 
@@ -527,13 +532,14 @@ The Loop Points command sets up looping for a given track (or TUID). If multiple
 | 15 | Fade In MSB | `0x00` | 
 | 16 | Fade Out LSB | `0x00` | 
 | 17 | Fade Out MSB | `0x00` | 
-| 18 | Alert Margin LSB | `0xF4` | 
-| 19 | Alert Margin MSB | `0x01` | 
-| 20 | Next Track LSB | `0x00` | 
-| 21 | Next Track MSB | `0x00` | 
-| 22 | Track Number LSB | `0xC8` | 
-| 23 | Track Number MSB | `0x00` | 
-| 24 | End of Message (EOM) | `0x55` | 
+| 18 | Loops Per Phrase | `0x01` |
+| 19 | Alert Margin LSB | `0xF4` | 
+| 20 | Alert Margin MSB | `0x01` | 
+| 21 | Next Track LSB | `0x00` | 
+| 22 | Next Track MSB | `0x00` | 
+| 23 | Track Number LSB | `0xC8` | 
+| 24 | Track Number MSB | `0x00` | 
+| 25 | End of Message (EOM) | `0x55` | 
 
 
 #### Example Packet (Start TUID 70000 from A (00:15) to B (02:00) forever, alert 500ms before finish)
@@ -542,7 +548,7 @@ The Loop Points command sets up looping for a given track (or TUID). If multiple
 | ----- | ----- | ----- | 
 | 0 | Start of Message 1 (SOM1) | `0xF0` | 
 | 1 | Start of Message 2 (SOM2) | `0xAA` | 
-| 2 | Packet Length | `0x1B` | 
+| 2 | Packet Length | `0x1C` | 
 | 3 | CMD: Loop Points | `0x63` | 
 | 4 | Flags | `0x11` | 
 | 5 | Loop Count | `0xFF` | 
@@ -557,16 +563,17 @@ The Loop Points command sets up looping for a given track (or TUID). If multiple
 | 14 | Fade In LSB | `0x00` | 
 | 15 | Fade In MSB | `0x00` | 
 | 16 | Fade Out LSB | `0x00` | 
-| 17 | Fade Out MSB | `0x00` | 
-| 18 | Alert Margin LSB | `0xF4` | 
-| 19 | Alert Margin MSB | `0x01` | 
-| 20 | Next Track LSB | `0x00` | 
-| 21 | Next Track MSB | `0x00` | 
-| 22 | TUID byte 0 | `0x70` | 
-| 23 | TUID byte 1 | `0x11` | 
-| 24 | TUID byte 2 | `0x01` | 
-| 25 | TUID byte 3 | `0x00` | 
-| 26 | End of Message (EOM) | `0x55` | 
+| 17 | Fade Out MSB | `0x00` |
+| 18 | Loops Per Phrase | `0x01` |
+| 19 | Alert Margin LSB | `0xF4` | 
+| 20 | Alert Margin MSB | `0x01` | 
+| 21 | Next Track LSB | `0x00` | 
+| 22 | Next Track MSB | `0x00` | 
+| 23 | TUID byte 0 | `0x70` | 
+| 24 | TUID byte 1 | `0x11` | 
+| 25 | TUID byte 2 | `0x01` | 
+| 26 | TUID byte 3 | `0x00` | 
+| 27 | End of Message (EOM) | `0x55` | 
 
 
 ---
@@ -654,11 +661,23 @@ The Set Events Flags command tells the RPU-SP which events that the controller w
 
 The Set Soundtrack Folder tells the RPU-SP to use a folder on the SD card instead of looking for WAV files in the root. Soundtrack folders must be named “AltSoundtrackNNN”, with NNN being an integer between 1-255. Soundtrack 0 is the default and is assumed to be the root of the SD card. The soundtrack folder names do not need to be contiguous. If an SD card contains the folders AltSoundtrack005 and AltSoundtrack20, the number of folders will be calculated to be 3 (the number of folders + the root), and Set Soundtrack Folder of 1 would set folder AltSoundtrack005 as the active folder (ordered by number without leading zeroes, instead of strictly alpha). If a folder contains an “example.wav”, that can be played to give the operator an idea of the folder’s contents.
 
+Each soundtrack folder (including the root) can contain a `“soundtrack.ini”` that contains metadata for this soundtrack. This allows the soundtrack to define its own loop points for the music tracks. Controller code should publish what track numbers and loop point numbers it expects to find. 
+#### Example `”soundtrack.ini"`
+```
+[Metadata]
+Preview = example.wav ; play this wav file for operator when switching soundtracks
+; alternate format: Preview = 400 ; play this track number for operator when switching soundtracks
+
+[Track 400]
+Loop 1 = 190604, 369026, 1 ; A=190604, B=369026, 1 loop per phrase
+Loop 2 = 11661, 33952, 4 ; A=11661, B=33952, 4 loops per phrase
+```
+
 #### Parameters
 * **Action:** 8-bit unsigned integer of flags
   * `0x01`: switch to new folder
   * `0x02`: pass through to root (if a sample doesn’t exist in folder, map to root folder)
-  * `0x80`: play folder’s “example.wav” 
+  * `0x80`: play folder’s Preview (`“example.wav”`, or other file/track defined in `"soundtrack.ini”`)
 * **Folder Num:** 8-bit unsigned integer 
    
 #### Example Packet (Switch to folder “AltSoundtrack2” assuming it’s the 2nd folder on the SD card, pass through missing tracks to root)
@@ -676,6 +695,50 @@ The Set Soundtrack Folder tells the RPU-SP to use a folder on the SD card instea
   
 ---
 
+### Get Num Loops (`0x68`)
+
+The Get Num Loops command is used to discover if there are any pre-defined loops for a given track. Response comes in a Loop Report (`0x8C`). 
+
+#### Parameters
+* **Track Number:** 16-bit unsigned integer (Tracks 1 - 4096).
+   
+#### Example Packet (Request number of loops defined for track 400)
+
+| Byte Index | Description | Example / Value | 
+| ----- | ----- | ----- | 
+| 0 | Start of Message 1 (SOM1) | `0xF0` | 
+| 1 | Start of Message 2 (SOM2) | `0xAA` | 
+| 2 | Packet Length | `0x07` | 
+| 3 | CMD: Get Num Loops | `0x68` | 
+| 4 | Track Number LSB | `0x90` | 
+| 5 | Track Number MSB | `0x01` | 
+| 6 | End of Message (EOM) | `0x55` | 
+  
+---
+
+### Get Loop Points (`0x69`)
+
+The Get Loop Points command asks for the details of a loop defined in a track. Response comes in a Loop Report (`0x8C`). 
+**Important Note:** If a track reports (from Get Num Loops, `0x68`) that it has 3 loops, then this command can request the details of the first, second, and third loop defined. That doesn’t necessarily align with Loop 1, Loop 2, and Loop 3. The loop points in the `"soundtrack.ini”` might be defined as Loop 5, Loop 7, and Loop 8. Asking for the details of the first set of loop points (Loop Index 0) will then retrieve the details of “Loop 5”.
+
+#### Parameters
+* **Track Number:** 16-bit unsigned integer (Tracks 1 - 4096).
+* **Loop Index:** 8-bit unsigned integer (zero-based index)
+   
+#### Example Packet (Request details of the first loop defined for Track Number 400)
+
+| Byte Index | Description | Example / Value | 
+| ----- | ----- | ----- | 
+| 0 | Start of Message 1 (SOM1) | `0xF0` | 
+| 1 | Start of Message 2 (SOM2) | `0xAA` | 
+| 2 | Packet Length | `0x08` | 
+| 3 | CMD: Get Loop Points | `0x69` | 
+| 4 | Track Number LSB | `0x90` | 
+| 5 | Track Number MSB | `0x01` | 
+| 6 | Loop Index | `0x00` | 
+| 7 | End of Message (EOM) | `0x55` | 
+  
+---
 
 ### Synth Control (`0x70`)
 
@@ -715,6 +778,7 @@ If this RPU-SP can emulate a synthesizer (SB-300, Squawk & Talk, DCS, etc.), thi
       * `0x0A02`: DCS sound card emulation
   * `0x81`: Set Synth Status
     * Adds 16-bit unsigned integer for Synth Type (see above)
+      * `0xFFFF`: Additional value, used only to de-activate all synth capabilities
     * Adds 8-bit unsigned integer for Synth Status
       * `0x00`: de-activate synth
       * `0x01`: activate synth
@@ -909,6 +973,51 @@ The Soundtrack Response is used to report on the number of soundtracks available
 
 ---
 
+### Loop Report (`0x8C`)
+
+The Loop Report Response is used to report on the number of loops for a track, or the loop point details of a track.
+
+#### Parameters
+* **Track Number:** 16-bit unsigned integer
+* **Report Type:** 8-bit unsigned integer
+  * `0x00`: number of loops report
+  * `0x01`: loop points details report
+* **Report Data:**
+  * (for report type `0x00`)
+    * **Number of Loops:** 8-bit unsigned integer
+  * (for report type `0x01`)
+    * **Loop Index:** 8-bit unsigned integer, loop N of (Number of Loops)
+    * **Loop Number:** 8-bit unsigned integer, loop’s INI-file-defined number
+    * **A:** 32-bit unsigned integer, A point
+    * **B:** 32-bit unsigned integer, B point
+    * **Loops Per Phrase:** 8-bit unsigned integer
+
+#### Example Packet (Loop Details Report for track 401, first loop)
+
+| Byte Index | Description | Example / Value | 
+| ----- | ----- | ----- | 
+| 0 | Start of Message 1 (SOM1) | `0xF0` | 
+| 1 | Start of Message 2 (SOM2) | `0xAA` | 
+| 2 | Packet Length | `0x13` | 
+| 3 | RSP: Loop Report | `0x8C` | 
+| 4 | Track Number LSB | `0x91` | 
+| 5 | Track Number MSB | `0x01` | 
+| 6 | Report Type | `0x01` | 
+| 7 | Loop Index | `0x00` | 
+| 8 | Loop Number | `0x05` | 
+| 9 | A byte 0 | `0xFC` (661500 ticks = 15 s) | 
+| 10 | A byte 1 | `0x17` | 
+| 11 | A byte 2 | `0x0A` | 
+| 12 | A byte 3 | `0x00` | 
+| 13 | B byte 0 | `0xE0` (5292000 ticks = 120 s) | 
+| 14 | B byte 1 | `0xBF` | 
+| 15 | B byte 2 | `0x50` | 
+| 16 | B byte 3 | `0x00` | 
+| 17 | Loops Per Phrase | `0x01` | 
+| 18 | End of Message (EOM) | `0x55` | 
+
+---
+
 ### Synth Response (`0x8F`)
 
 The Synth Response carries telemetry or state information originating specifically from the synthesizer card.
@@ -960,3 +1069,5 @@ The Synth Response carries telemetry or state information originating specifical
 | 69 | End of Message (EOM) | `0x55` |
 
 
+## 6. INI file (rpu-sp.ini)
+TBD
